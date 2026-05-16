@@ -20,7 +20,6 @@ SLEEP_ENTRE_HILOS = 30
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# ── Colores ANSI ──────────────────────────────────────────────────────────────
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -59,7 +58,6 @@ def spinner_thread(estado):
     clear_line()
 
 
-# ── Leer lista ────────────────────────────────────────────────────────────────
 if len(sys.argv) > 1:
     urls = sys.argv[1:]
 else:
@@ -137,7 +135,6 @@ for i, url in enumerate(urls, 1):
             if not any(x in linea for x in ["theme-light", "color-", "--rem", "None_"]):
                 errores_hilo.append(linea)
 
-    # ── Log ───────────────────────────────────────────────────────────────────
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(f"\nURL: {url}\n")
         f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -152,7 +149,6 @@ for i, url in enumerate(urls, 1):
             f.write("Sin errores.")
         f.write("\n")
 
-    # ── Resumen del hilo ──────────────────────────────────────────────────────
     duracion = int(time.time() - inicio)
     mins = duracion // 60
     segs = duracion % 60
@@ -183,7 +179,6 @@ for i, url in enumerate(urls, 1):
 
     print()
 
-# ── Resumen final ─────────────────────────────────────────────────────────────
 print(f"{BOLD}{'═' * 50}{RESET}")
 print(
     f"{BOLD}  Descarga terminada — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}"
