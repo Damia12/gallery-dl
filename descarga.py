@@ -116,7 +116,10 @@ for i, url in enumerate(urls, 1):
         "timeout": False,
     }
 
-    cmd = [GALLERY_DL, "-c", CONFIG, url]
+    if sys.platform == "win32":
+        cmd = [GALLERY_DL, "-c", CONFIG, url]
+    else:
+        cmd = ["stdbuf", "-oL", GALLERY_DL, "-c", CONFIG, url]
     if reset_archive:
         cmd.append("--no-download-archive")
 
