@@ -1,8 +1,8 @@
+import os
 import subprocess
 import sys
-import os
-import time
 import threading
+import time
 from datetime import datetime
 
 GALLERY_DL = "gallery-dl.exe" if sys.platform == "win32" else "gallery-dl"
@@ -256,4 +256,5 @@ if not errores_totales and not timeouts_totales:
     print(f"  {GREEN}Todos los hilos sin errores.{RESET}")
 print(f"{BOLD}{'═' * 50}{RESET}")
 
-input("\nPresiona Enter para cerrar...")
+if sys.platform == "win32":
+    input("\nPresiona Enter para cerrar...")
