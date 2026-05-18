@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+
+import errno
 import os
 import re
 import subprocess
@@ -6,15 +9,12 @@ import threading
 import time
 from datetime import datetime
 
-# ── Detección de OS e Imports Condicionales ─────────────────────────────
 IS_WINDOWS = sys.platform == "win32"
 
 if not IS_WINDOWS:
-    import errno
     import pty
     import select
 
-# ── Configuración según OS ──────────────────────────────────────────────
 if IS_WINDOWS:
     GALLERY_DL = "gallery-dl.exe"
     CONFIG = r"C:\gallery-dl\gallery-dl_win.conf"
@@ -31,19 +31,28 @@ TIMEOUT_ACTIVIDAD = 300
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# ── Constantes ANSI ─────────────────────────────────────────────────────
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 CYAN = "\033[36m"
+MAGENTA = "\033[35m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 GRAY = "\033[90m"
 RED = "\033[31m"
+WHITE = "\033[37m"
+
+ACCENT = WHITE
 
 SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+spinner_idx = 0
 
 ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+RE_PROGRESS = re.compile(
+    r"(\d+)%\s+([\d.]+)\s*([KkMmGgTt]?[Bb])\s+([\d.]+)\s*([KkMmGgTt]?[Bb]/s)",
+    re.IGNORECASE,
+)
 
 
 def clear_line():
@@ -51,21 +60,71 @@ def clear_line():
     sys.stdout.flush()
 
 
-# ==============================================================================
-# LÓGICA WINDOWS
-# ==============================================================================
-def spinner_thread(estado):
+def formatear_tiempo(segundos):
+    m = int(segundos) // 60
+    s = int(segundos) % 60
+    return f"{m}m {s}s" if m else f"{s}s"
+
+
+def nombre_visible(ruta):
+    base = os.path.basename(ruta)
+    if " " in base:
+        return base.split(" ", 1)[1]
+    return base
+
+
+def render_progress_linux(linea_pura):
+    global spinner_idx
+    m = RE_PROGRESS.match(linea_pura.strip())
+    if not m:
+        return
+
+    anim = SPINNER[spinner_idx % len(SPINNER)]
+    spinner_idx += 1
+
+    pct = int(m.group(1))
+    downloaded = float(m.group(2))
+    download_unit = m.group(3).upper()
+    speed = float(m.group(4))
+    speed_unit = m.group(5).upper()
+
+    ancho_barra = 30
+    llenos = int(ancho_barra * pct / 100)
+    vacios = ancho_barra - llenos
+
+    # Consistencia de color absoluta mediante la variable ACCENT
+    barra_interna = ("━" * llenos) + (" " * vacios)
+    barra_visual = f"{DIM}│{RESET}{ACCENT}{barra_interna}{RESET}{DIM}│{RESET}"
+
+    sys.stdout.write(
+        f"\r  {ACCENT}{anim}{RESET} {barra_visual} {pct:>3}% │ {downloaded:.2f}{download_unit} │ {speed:.0f}{speed_unit} │\033[K{RESET}"
+    )
+    sys.stdout.flush()
+
+
+def spinner_thread_windows(estado):
     idx = 0
+    ancho_barra = 20
     while not estado["stop"]:
         elapsed = int(time.time() - estado["inicio"])
-        mins = elapsed // 60
-        segs = elapsed % 60
-        tiempo = f"{mins}m {segs}s" if mins > 0 else f"{segs}s"
-        resumen = f"{estado['nuevo']}"
+        tiempo = formatear_tiempo(elapsed)
+
+        resumen = f"{estado['nuevo']} nuevos"
         if estado["done"] > 0:
-            resumen += f" | {estado['done']} done"
+            resumen += f" | {estado['done']} ya descargados"
+
+        pos = idx % (ancho_barra + 4)
+        barra_lista = ["·"] * ancho_barra
+        for i in range(4):
+            p = pos - i
+            if 0 <= p < ancho_barra:
+                barra_lista[p] = "━"
+        barra_interna = "".join(barra_lista)
+
+        barra_visual = f"{DIM}│{RESET}{ACCENT}{barra_interna}{RESET}{DIM}│{RESET}"
+
         sys.stdout.write(
-            f"\r  {CYAN}{SPINNER[idx % len(SPINNER)]}{RESET} {DIM}{resumen} —  {tiempo}{RESET}"
+            f"\r  {ACCENT}{SPINNER[idx % len(SPINNER)]}{RESET} {barra_visual} {DIM}{resumen} — {tiempo}{RESET}\033[K"
         )
         sys.stdout.flush()
         idx += 1
@@ -94,6 +153,9 @@ def descargar_windows(url, reset_archive):
     estado_spinner = {"stop": False, "inicio": inicio, "nuevo": 0, "done": 0}
     estado_watchdog = {"stop": False, "ultimo_output": time.time(), "timeout": False}
 
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
     proceso = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -103,7 +165,9 @@ def descargar_windows(url, reset_archive):
         errors="replace",
     )
 
-    spin = threading.Thread(target=spinner_thread, args=(estado_spinner,), daemon=True)
+    spin = threading.Thread(
+        target=spinner_thread_windows, args=(estado_spinner,), daemon=True
+    )
     watch = threading.Thread(
         target=watchdog_thread,
         args=(proceso, estado_watchdog, TIMEOUT_ACTIVIDAD),
@@ -112,30 +176,38 @@ def descargar_windows(url, reset_archive):
     spin.start()
     watch.start()
 
-    for linea in proceso.stdout:
-        linea_strip = linea.strip()
-        if not linea_strip:
-            continue
+    try:
+        for linea in proceso.stdout:
+            linea_strip = linea.strip()
+            if not linea_strip:
+                continue
 
-        estado_watchdog["ultimo_output"] = time.time()
-        clear_line()
+            estado_watchdog["ultimo_output"] = time.time()
+            clear_line()
 
-        if linea_strip.startswith("#"):
-            estado_spinner["done"] += 1
-            ruta = linea_strip[1:].strip()
-            print(f"  {GRAY}[{estado_spinner['done']:>3}] [DONE] {ruta}{RESET}")
-        else:
-            estado_spinner["nuevo"] += 1
-            archivos_nuevos.append(linea_strip)
-            print(f"  {GREEN}[{estado_spinner['nuevo']:>3}]{RESET} {linea_strip}")
+            if linea_strip.startswith("#"):
+                estado_spinner["done"] += 1
+                ruta = linea_strip[1:].strip()
+                print(
+                    f"  {GRAY}[{estado_spinner['done']:>3}] [DONE] {nombre_visible(ruta)}{RESET}"
+                )
+            else:
+                estado_spinner["nuevo"] += 1
+                archivos_nuevos.append(linea_strip)
+                print(
+                    f"  {GREEN}[{estado_spinner['nuevo']:>3}]{RESET} {nombre_visible(linea_strip)}"
+                )
+    finally:
+        stderr = proceso.stderr.read()
+        proceso.wait()
 
-    stderr = proceso.stderr.read()
-    proceso.wait()
+        estado_spinner["stop"] = True
+        estado_watchdog["stop"] = True
+        spin.join()
+        watch.join(timeout=2)
 
-    estado_spinner["stop"] = True
-    estado_watchdog["stop"] = True
-    spin.join()
-    watch.join(timeout=2)
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
 
     for linea in stderr.splitlines():
         if any(
@@ -154,9 +226,6 @@ def descargar_windows(url, reset_archive):
     )
 
 
-# ==============================================================================
-# LÓGICA LINUX / WSL
-# ==============================================================================
 def descargar_linux(url, reset_archive):
     cmd = [GALLERY_DL, "-c", CONFIG, url]
     if reset_archive:
@@ -173,6 +242,9 @@ def descargar_linux(url, reset_archive):
     env_vars = os.environ.copy()
     env_vars["PYTHONUNBUFFERED"] = "1"
 
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
     master_fd, slave_fd = pty.openpty()
     proceso = subprocess.Popen(
         cmd, stdout=slave_fd, stderr=slave_fd, close_fds=True, env=env_vars
@@ -181,120 +253,125 @@ def descargar_linux(url, reset_archive):
 
     buffer = ""
     ultimo_output = time.time()
-    spinner_idx = 0
 
-    while True:
-        r, _, _ = select.select([master_fd], [], [], 1.0)
+    try:
+        while True:
+            r, _, _ = select.select([master_fd], [], [], 1.0)
 
-        if not r:
-            if time.time() - ultimo_output > TIMEOUT_ACTIVIDAD:
-                proceso.kill()
-                timeout_ocurrido = True
+            if not r:
+                if time.time() - ultimo_output > TIMEOUT_ACTIVIDAD:
+                    proceso.kill()
+                    timeout_ocurrido = True
+                    break
+                continue
+
+            try:
+                chunk = os.read(master_fd, 4096).decode("utf-8", "replace")
+            except OSError as e:
+                if e.errno == errno.EIO:
+                    break
+                raise
+
+            if not chunk:
                 break
-            continue
+
+            ultimo_output = time.time()
+
+            buffer += chunk
+            buffer = buffer.replace("\r\n", "\n")
+
+            while True:
+                idx_n = buffer.find("\n")
+                idx_r = buffer.find("\r")
+
+                if idx_n == -1 and idx_r == -1:
+                    break
+
+                es_linea_completa = False
+                linea = ""
+
+                if idx_n != -1 and (idx_r == -1 or idx_n < idx_r):
+                    linea = buffer[:idx_n]
+                    buffer = buffer[idx_n + 1 :]
+                    es_linea_completa = True
+
+                elif idx_r != -1:
+                    texto_antes_del_r = buffer[:idx_r]
+
+                    if texto_antes_del_r.strip() and not re.search(
+                        r"\d+%", texto_antes_del_r
+                    ):
+                        linea = texto_antes_del_r
+                        buffer = buffer[idx_r + 1 :]
+                        es_linea_completa = True
+                    else:
+                        if idx_r == len(buffer) - 1:
+                            break
+
+                        buffer = buffer[idx_r + 1 :]
+                        prog_limpio = texto_antes_del_r.strip()
+                        if prog_limpio and "%" in prog_limpio:
+                            prog_pura = ANSI_ESCAPE.sub("", prog_limpio).strip()
+                            render_progress_linux(prog_pura)
+                        continue
+
+                if es_linea_completa:
+                    linea_limpia = linea.strip()
+                    if not linea_limpia:
+                        continue
+
+                    if "%" in linea_limpia and any(
+                        x in linea_limpia for x in ["MB", "KB", "B/s"]
+                    ):
+                        prog_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
+                        render_progress_linux(prog_pura)
+                        continue
+
+                    es_done = "\x1b[2m" in linea_limpia
+                    es_error = any(
+                        k in linea_limpia.lower() for k in ["error", "warning"]
+                    )
+
+                    linea_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
+
+                    if not linea_pura:
+                        continue
+                    if linea_pura == ultima_ruta:
+                        continue
+                    ultima_ruta = linea_pura
+
+                    partes = linea_pura.split(" ", 1)
+                    nombre_visible_str = partes[1] if len(partes) > 1 else linea_pura
+
+                    if es_done:
+                        contador_done += 1
+                        sys.stdout.write(
+                            f"\r\033[2K  {DIM}[{contador_done:>3}] [DONE] {nombre_visible_str}{RESET}\n"
+                        )
+                    elif es_error:
+                        errores_hilo.append(linea_pura)
+                        sys.stdout.write(f"\r\033[2K  {YELLOW}⚠ {linea_pura}{RESET}\n")
+                    else:
+                        contador_nuevo += 1
+                        archivos_nuevos.append(linea_pura)
+                        sys.stdout.write(
+                            f"\r\033[2K  {GREEN}[{contador_nuevo:>3}] {nombre_visible_str}{RESET}\n"
+                        )
+
+                    sys.stdout.flush()
+    finally:
+        proceso.wait()
+        clear_line()
+
+        # Restaurar cursor de escritura en Linux/WSL
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
 
         try:
-            chunk = os.read(master_fd, 4096).decode("utf-8", "replace")
-        except OSError as e:
-            if e.errno == errno.EIO:
-                break
-            raise
+            os.close(master_fd)
+        except OSError:
+            pass
 
-        if not chunk:
-            break
-
-        ultimo_output = time.time()
-
-        buffer += chunk
-        buffer = buffer.replace("\r\n", "\n")
-
-        while True:
-            idx_n = buffer.find("\n")
-            idx_r = buffer.find("\r")
-
-            if idx_n == -1 and idx_r == -1:
-                break
-
-            es_linea_completa = False
-            linea = ""
-
-            if idx_n != -1 and (idx_r == -1 or idx_n < idx_r):
-                linea = buffer[:idx_n]
-                buffer = buffer[idx_n + 1 :]
-                es_linea_completa = True
-
-            elif idx_r != -1:
-                texto_antes_del_r = buffer[:idx_r]
-
-                if texto_antes_del_r.strip() and not re.search(
-                    r"\d+%", texto_antes_del_r
-                ):
-                    linea = texto_antes_del_r
-                    buffer = buffer[idx_r + 1 :]
-                    es_linea_completa = True
-                else:
-                    if idx_r == len(buffer) - 1:
-                        break
-
-                    buffer = buffer[idx_r + 1 :]
-                    prog_limpio = texto_antes_del_r.strip()
-                    if prog_limpio and "%" in prog_limpio:
-                        prog_pura = ANSI_ESCAPE.sub("", prog_limpio).strip()
-                        anim = SPINNER[spinner_idx % len(SPINNER)]
-                        spinner_idx += 1
-                        sys.stdout.write(f"\r  {CYAN}{anim}{RESET} {prog_pura}\033[K")
-                        sys.stdout.flush()
-                    continue
-
-            if es_linea_completa:
-                linea_limpia = linea.strip()
-                if not linea_limpia:
-                    continue
-
-                if "%" in linea_limpia and any(
-                    x in linea_limpia for x in ["MB", "KB", "B/s"]
-                ):
-                    prog_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
-                    anim = SPINNER[spinner_idx % len(SPINNER)]
-                    spinner_idx += 1
-                    sys.stdout.write(f"\r  {CYAN}{anim}{RESET} {prog_pura}\033[K")
-                    sys.stdout.flush()
-                    continue
-
-                es_done = "\x1b[2m" in linea_limpia
-                es_error = any(k in linea_limpia.lower() for k in ["error", "warning"])
-
-                linea_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
-
-                if not linea_pura:
-                    continue
-                if linea_pura == ultima_ruta:
-                    continue
-                ultima_ruta = linea_pura
-
-                partes = linea_pura.split(" ", 1)
-                nombre_visible = partes[1] if len(partes) > 1 else linea_pura
-
-                if es_done:
-                    contador_done += 1
-                    sys.stdout.write(
-                        f"\r\033[2K  {DIM}[{contador_done:>3}] [DONE] {nombre_visible}{RESET}\n"
-                    )
-                elif es_error:
-                    errores_hilo.append(linea_pura)
-                    sys.stdout.write(f"\r\033[2K  {YELLOW}⚠ {linea_pura}{RESET}\n")
-                else:
-                    contador_nuevo += 1
-                    archivos_nuevos.append(linea_pura)
-                    # Eliminada la etiqueta [N] aquí, se mantiene el color verde
-                    sys.stdout.write(
-                        f"\r\033[2K  {GREEN}[{contador_nuevo:>3}] {nombre_visible}{RESET}\n"
-                    )
-
-                sys.stdout.flush()
-
-    proceso.wait()
-    clear_line()
     return (
         archivos_nuevos,
         errores_hilo,
@@ -305,9 +382,6 @@ def descargar_linux(url, reset_archive):
     )
 
 
-# ==============================================================================
-# BUCLE PRINCIPAL
-# ==============================================================================
 if __name__ == "__main__":
     reset_archive = "--reset" in sys.argv
     if reset_archive:
