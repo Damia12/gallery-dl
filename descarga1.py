@@ -28,7 +28,6 @@ else:
 
 SLEEP_ENTRE_HILOS = 30
 TIMEOUT_ACTIVIDAD = 300
-TIMEOUT_SIN_ARCHIVOS = 600
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -123,6 +122,7 @@ def spinner_thread_windows(estado, lock_print):
 
         barra_visual = f"{DIM}│{RESET}{ACCENT}{barra_interna}{RESET}{DIM}│{RESET}"
 
+        # Usamos el lock para asegurar que la animación no choque con los prints principales
         with lock_print:
             sys.stdout.write(
                 f"\r  {ACCENT}{SPINNER[idx % len(SPINNER)]}{RESET} {barra_visual} {DIM}{resumen} — {tiempo}{RESET}\033[K"
@@ -136,12 +136,7 @@ def spinner_thread_windows(estado, lock_print):
 
 def watchdog_thread(proceso, estado, timeout):
     while not estado["stop"]:
-        ahora = time.time()
-        if ahora - estado["ultimo_output"] > timeout:
-            proceso.kill()
-            estado["timeout"] = True
-            break
-        if ahora - estado["ultimo_archivo"] > TIMEOUT_SIN_ARCHIVOS:
+        if time.time() - estado["ultimo_output"] > timeout:
             proceso.kill()
             estado["timeout"] = True
             break
@@ -176,12 +171,7 @@ def descargar_windows(url, reset_archive):
     contador = {"seq": 0}
 
     estado_spinner = {"stop": False, "inicio": inicio, "nuevo": 0, "done": 0}
-    estado_watchdog = {
-        "stop": False,
-        "ultimo_output": time.time(),
-        "ultimo_archivo": time.time(),
-        "timeout": False,
-    }
+    estado_watchdog = {"stop": False, "ultimo_output": time.time(), "timeout": False}
 
     sys.stdout.write("\033[?25l")
     sys.stdout.flush()
@@ -210,6 +200,7 @@ def descargar_windows(url, reset_archive):
                 )
                 sys.stdout.flush()
 
+    # Pasamos lock_print al spinner para sincronización nativa
     spin = threading.Thread(
         target=spinner_thread_windows, args=(estado_spinner, lock_print), daemon=True
     )
@@ -236,7 +227,6 @@ def descargar_windows(url, reset_archive):
 
                 if linea_strip.startswith("#"):
                     estado_spinner["done"] += 1
-                    estado_watchdog["ultimo_archivo"] = time.time()
                     contador["seq"] += 1
                     ruta = linea_strip[1:].strip()
                     print(
@@ -244,7 +234,6 @@ def descargar_windows(url, reset_archive):
                     )
                 else:
                     estado_spinner["nuevo"] += 1
-                    estado_watchdog["ultimo_archivo"] = time.time()
                     contador["seq"] += 1
                     archivos_nuevos.append(linea_strip)
                     print(
@@ -285,7 +274,6 @@ def descargar_linux(url, reset_archive):
     contador_seq = 0
     ultima_ruta = ""
     timeout_ocurrido = False
-    ultimo_archivo = time.time()
 
     env_vars = os.environ.copy()
     env_vars["PYTHONUNBUFFERED"] = "1"
@@ -307,12 +295,7 @@ def descargar_linux(url, reset_archive):
             r, _, _ = select.select([master_fd], [], [], 1.0)
 
             if not r:
-                ahora = time.time()
-                if ahora - ultimo_output > TIMEOUT_ACTIVIDAD:
-                    proceso.kill()
-                    timeout_ocurrido = True
-                    break
-                if ahora - ultimo_archivo > TIMEOUT_SIN_ARCHIVOS:
+                if time.time() - ultimo_output > TIMEOUT_ACTIVIDAD:
                     proceso.kill()
                     timeout_ocurrido = True
                     break
@@ -381,9 +364,8 @@ def descargar_linux(url, reset_archive):
                         continue
 
                     es_done = "\x1b[2m" in linea_limpia
-                    es_error = es_linea_error(linea_limpia)
-
                     linea_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
+                    es_error = es_linea_error(linea_pura)
 
                     if not linea_pura:
                         continue
@@ -398,7 +380,6 @@ def descargar_linux(url, reset_archive):
 
                     if es_done:
                         contador_done += 1
-                        ultimo_archivo = time.time()
                         sys.stdout.write(
                             f"\r\033[2K  {DIM}[{contador_seq:>3}] [DONE] {nombre_visible_str}{RESET}\n"
                         )
@@ -409,7 +390,6 @@ def descargar_linux(url, reset_archive):
                         )
                     else:
                         contador_nuevo += 1
-                        ultimo_archivo = time.time()
                         archivos_nuevos.append(linea_pura)
                         sys.stdout.write(
                             f"\r\033[2K  {GREEN}[{contador_seq:>3}] {nombre_visible_str}{RESET}\n"
