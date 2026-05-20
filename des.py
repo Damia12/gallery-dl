@@ -447,8 +447,16 @@ def descargar_linux(url):
     )
 
 
-def ejecutar_con_reintentos(url, intento=1):
-    """Ejecuta la descarga con hasta MAX_REINTENTOS reintentos si hay errores."""
+def esperar_entre_hilos(i, total):
+    """Pausa entre hilos y entre reintentos. Imprime el aviso solo si hay más trabajo."""
+    if i < total:
+        print(f"\n  {DIM}Esperando {SLEEP_ENTRE_HILOS}s...{RESET}\n")
+        time.sleep(SLEEP_ENTRE_HILOS)
+    print()
+
+
+def ejecutar_descarga(url, intento=1):
+    """Despacha la descarga a la implementación correcta según plataforma."""
     if intento > 1:
         print(f"  {YELLOW}↺ Reintento {intento - 1}/{MAX_REINTENTOS}{RESET}\n")
 
@@ -530,8 +538,6 @@ if __name__ == "__main__":
 
     errores_totales = []
     timeouts_totales = []
-
-    # ── INICIO DEL BUCLE DE COMPROBACIÓN ──
     for i, url in enumerate(urls, 1):
         nombre = url.rstrip("/").split("/")[-1][:60]
         log_file = os.path.join(LOG_DIR, f"{nombre}.log")
@@ -540,32 +546,36 @@ if __name__ == "__main__":
         print(f"  {GRAY}{url}{RESET}\n")
 
         # 1. Ejecución del Intento 1
-        archivos, errs, nuevos, done, timeout, duracion = ejecutar_con_reintentos(
+        archivos, errs, nuevos, done, timeout, duracion = ejecutar_descarga(
             url, intento=1
         )
 
-        # 2. Control de Timeout inmediato (Primer intento)
+        # Bug 3 fix: timeout en el primer intento — nunca entraba al bloque de
+        # reintentos (condición era `errs and not timeout`), así que el log
+        # quedaba vacío y el hilo no se registraba en timeouts_totales.
         if timeout:
             timeouts_totales.append(nombre)
-            print(f"\n  {RED}⏱ Timeout inmediato — proceso terminado{RESET}")
+            print(
+                f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
+            )
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(f"\nURL: {url}\n")
                 f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n")
                 f.write(f"{'=' * 60}\n\n")
-            if i < len(urls):
-                print(f"\n  {DIM}Esperando {SLEEP_ENTRE_HILOS}s...{RESET}\n")
-                time.sleep(SLEEP_ENTRE_HILOS)
-            print()
+            esperar_entre_hilos(i, len(urls))
             continue
 
-        # 3. Bucle de reintentos automáticos si hubo errores normales
-        if errs and not timeout:
-            for reintento in range(2, MAX_REINTENTOS + 2):
-                print(f"\n  {YELLOW}⚠ {len(errs)} errores detectados{RESET}")
+        # Bucle de reintentos automáticos si hubo errores en el primer intento.
+        # Bug 1 fix (parcial): acumulamos errs_acumulados por separado para no
+        # perderlos si el último reintento termina en timeout.
+        if errs:
+            errs_acumulados = list(errs)
+            for reintento in range(1, MAX_REINTENTOS + 1):
+                print(f"\n  {YELLOW}⚠ {len(errs_acumulados)} errores detectados{RESET}")
                 time.sleep(SLEEP_ENTRE_HILOS)
                 archivos2, errs2, nuevos2, done2, timeout2, duracion2 = (
-                    ejecutar_con_reintentos(url, intento=reintento)
+                    ejecutar_descarga(url, intento=reintento + 1)
                 )
 
                 archivos += archivos2
@@ -573,29 +583,39 @@ if __name__ == "__main__":
                 done += done2
                 duracion += duracion2
 
-                errs = errs2
-                timeout = timeout2
-                if not errs2 or timeout2:
+                if timeout2:
+                    # Bug 1 fix: timeout tras reintentos — preservar errores
+                    # acumulados de intentos anteriores, no sobreescribir con
+                    # errs2 (que puede estar vacío al morir el proceso).
+                    timeout = True
                     break
 
-        # 4. Control de Timeout post-reintentos (Guarda errores de intentos previos)
+                errs_acumulados = errs2
+                if not errs2:
+                    break
+
+            errs = errs_acumulados
+
+        # Bug 1 fix: timeout detectado dentro del bucle de reintentos.
+        # Escribe log con los errores previos ya registrados antes del timeout.
         if timeout:
             timeouts_totales.append(nombre)
-            print(f"\n  {RED}⏱ Timeout tras reintentos — proceso terminado{RESET}")
+            print(
+                f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
+            )
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(f"\nURL: {url}\n")
                 f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 if errs:
-                    f.write("ERRORES PREVIOS:\n" + "\n".join(errs) + "\n")
+                    f.write("ERRORES:\n" + "\n".join(errs) + "\n")
                 f.write(f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n")
                 f.write(f"{'=' * 60}\n\n")
-            if i < len(urls):
-                print(f"\n  {DIM}Esperando {SLEEP_ENTRE_HILOS}s...{RESET}\n")
-                time.sleep(SLEEP_ENTRE_HILOS)
-            print()
+            esperar_entre_hilos(i, len(urls))
             continue
 
-        # 5. Escritura del flujo normal (Dentro del bucle y con su separador al final)
+        # Bug 2 fix: separador `=` descomentado — auditar.py usa `={10,}` para
+        # separar bloques de sesión; sin él múltiples sesiones en el mismo log
+        # se parseaban como una sola.
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\nURL: {url}\n")
             f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -609,7 +629,6 @@ if __name__ == "__main__":
             f.write("\n")
             f.write(f"{'=' * 60}\n\n")
 
-        # Interfaz visual de resumen del hilo actual
         mins, segs = duracion // 60, duracion % 60
         tiempo_str = f"{mins}m {segs}s" if mins > 0 else f"{segs}s"
         resumen = f"{nuevos} nuevos"
@@ -630,11 +649,10 @@ if __name__ == "__main__":
             print(f"  {GRAY}[✓] {nombre} — sin archivos nuevos{RESET}")
 
         if i < len(urls):
-            print(f"\n  {DIM}Esperando {SLEEP_ENTRE_HILOS}s...{RESET}\n")
-            time.sleep(SLEEP_ENTRE_HILOS)
-        print()
+            esperar_entre_hilos(i, len(urls))
+        else:
+            print()
 
-    # ── RESUMEN FINAL DE LA CORRIDA (FUERA DEL BUCLE FOR) ──
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
         f"{BOLD}  Descarga terminada — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}"
@@ -662,7 +680,7 @@ if __name__ == "__main__":
             )
     print(f"{BOLD}{'═' * 50}{RESET}")
 
-    # Si se procesó lista_retry.txt desde la opción 2 -> backup y purga
+    # Si se procesó lista_retry.txt → backup y borrar
     if os.path.exists(RETRY_FILE):
         with open(RETRY_FILE, encoding="utf-8") as f:
             urls_retry_procesadas = [
