@@ -79,6 +79,17 @@ def nombre_visible(ruta):
     return base
 
 
+def formatear_nombre_modelo(nombre_hilo):
+    """Transforma 'guro-sato-gurosato.1039671' en 'Guro Sato'."""
+    base = nombre_hilo.split(".")[0]  # Quita el ID numérico
+    partes = base.split("-")
+    vistas = []
+    for p in partes:
+        if p not in vistas and len(vistas) < 2:
+            vistas.append(p.capitalize())
+    return " ".join(vistas)
+
+
 def render_progress_linux(linea_pura):
     global spinner_idx
     m = RE_PROGRESS.match(linea_pura.strip())
@@ -168,7 +179,7 @@ def limpiar_error(linea):
     return re.sub(r"^\[gallery-dl\]\s*", "", linea).strip()
 
 
-def descargar_windows(url):
+def descargar_windows(url, nombre_modelo):
     cmd = [GALLERY_DL, "-c", CONFIG, url]
 
     inicio = time.time()
@@ -243,7 +254,7 @@ def descargar_windows(url):
                     contador["seq"] += 1
                     ruta = linea_strip[1:].strip()
                     print(
-                        f"  {GRAY}[{contador['seq']:>3}] [DONE] {nombre_visible(ruta)}{RESET}"
+                        f"  {GRAY}[{contador['seq']:>3}] [DONE] {nombre_modelo} - {nombre_visible(ruta)}{RESET}"
                     )
                 else:
                     estado_spinner["nuevo"] += 1
@@ -251,7 +262,7 @@ def descargar_windows(url):
                     contador["seq"] += 1
                     archivos_nuevos.append(linea_strip)
                     print(
-                        f"  {GREEN}[{contador['seq']:>3}]{RESET} {nombre_visible(linea_strip)}"
+                        f"  {GREEN}[{contador['seq']:>3}] {RESET} {nombre_modelo} - {nombre_visible(linea_strip)}"
                     )
     finally:
         proceso.wait()
@@ -259,7 +270,7 @@ def descargar_windows(url):
 
         estado_spinner["stop"] = True
         estado_watchdog["stop"] = True
-        spin.join()
+        spin.join(timeout=2)
         watch.join(timeout=2)
 
         sys.stdout.write("\033[?25h")
@@ -275,7 +286,7 @@ def descargar_windows(url):
     )
 
 
-def descargar_linux(url):
+def descargar_linux(url, nombre_modelo):
     cmd = [GALLERY_DL, "-c", CONFIG, url]
 
     inicio = time.time()
@@ -450,17 +461,15 @@ def esperar_entre_hilos(i, total):
     print()
 
 
-def ejecutar_descarga(url, intento=1):
+def ejecutar_descarga(url, nombre_modelo, intento=1):
     """Despacha la descarga a la implementación correcta según plataforma."""
-    if "timeout" in url.lower():
-        time.sleep(15)
     if intento > 1:
-        print(f"  {YELLOW}↺ Reintento {intento - 1}/{MAX_REINTENTOS}{RESET}\n")
+        print(f"  {YELLOW}[RETRY] {intento - 1}/{MAX_REINTENTOS}{RESET}\n")
 
     if IS_WINDOWS:
-        return descargar_windows(url)
+        return descargar_windows(url, nombre_modelo)
     else:
-        return descargar_linux(url)
+        return descargar_linux(url, nombre_modelo)
 
 
 def elegir_lista():
@@ -536,23 +545,24 @@ if __name__ == "__main__":
     timeouts_totales = []
     for i, url in enumerate(urls, 1):
         nombre = url.rstrip("/").split("/")[-1][:60]
+        nombre_modelo = formatear_nombre_modelo(nombre)
         log_file = os.path.join(LOG_DIR, f"{nombre}.log")
 
         print(f"{BOLD}[{i}/{len(urls)}]{RESET} {CYAN}{nombre}{RESET}")
         print(f"  {GRAY}{url}{RESET}\n")
 
         archivos, errs, nuevos, done, timeout, duracion = ejecutar_descarga(
-            url, intento=1
+            url=url, nombre_modelo=nombre_modelo, intento=1
         )
 
         if timeout:
             timeouts_totales.append(nombre)
             print(
-                f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
+                f"\n  {RED}[TIMEOUT] Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
             )
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"\nURL: {url}\n")
                 f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"\nURL: {url}\n")
                 f.write(f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n")
                 f.write(f"{'=' * 60}\n\n")
             esperar_entre_hilos(i, len(urls))
@@ -561,12 +571,15 @@ if __name__ == "__main__":
         if errs and es_retry_run:
             errs_acumulados = list(errs)
             for reintento in range(1, MAX_REINTENTOS + 1):
-                print(f"\n  {YELLOW}⚠ {len(errs_acumulados)} errores detectados{RESET}")
+                print(
+                    f"\n  {YELLOW}[!] {len(errs_acumulados)} errores detectados{RESET}"
+                )
                 time.sleep(SLEEP_ENTRE_HILOS)
                 archivos2, errs2, nuevos2, done2, timeout2, duracion2 = (
-                    ejecutar_descarga(url, intento=reintento + 1)
+                    ejecutar_descarga(
+                        url=url, nombre_modelo=nombre_modelo, intento=reintento + 1
+                    )
                 )
-
                 archivos += archivos2
                 nuevos += nuevos2
                 done += done2
@@ -585,11 +598,11 @@ if __name__ == "__main__":
         if timeout:
             timeouts_totales.append(nombre)
             print(
-                f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
+                f"\n  {RED}[TIMEOUT] Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
             )
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"\nURL: {url}\n")
                 f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"\nURL: {url}\n")
                 if errs:
                     f.write("ERRORES:\n" + "\n".join(errs) + "\n")
                 f.write(f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n")
@@ -598,8 +611,8 @@ if __name__ == "__main__":
             continue
 
         with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"\nURL: {url}\n")
             f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"\nURL: {url}\n")
             if archivos:
                 f.write("\n".join(archivos))
                 f.write("\n\n")
@@ -620,14 +633,14 @@ if __name__ == "__main__":
         if errs:
             errores_totales.append((nombre, len(errs)))
             print(
-                f"  {YELLOW}[X] {nombre} — {resumen} — {len(errs)} errores (ver log) — {tiempo_str}{RESET}"
+                f"  {YELLOW}[X] {nombre} — {resumen} — {len(errs)} [X] (ver log) — {tiempo_str}{RESET}"
             )
         elif nuevos > 0:
-            print(f"  {GREEN}[✓] {nombre} — {resumen} — {tiempo_str}{RESET}")
+            print(f"  {GREEN}[+] {nombre} — {resumen} — {tiempo_str}{RESET}")
         elif done > 0:
-            print(f"  {GRAY}[✓] {nombre} — todo ya descargado ({done} archivos){RESET}")
+            print(f"  {GRAY}[+] {nombre} — todo ya descargado ({done} archivos){RESET}")
         else:
-            print(f"  {GRAY}[✓] {nombre} — sin archivos nuevos{RESET}")
+            print(f"  {GRAY}[+] {nombre} — sin archivos nuevos{RESET}")
 
         esperar_entre_hilos(i, len(urls))
 

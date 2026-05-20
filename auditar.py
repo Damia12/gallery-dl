@@ -40,8 +40,8 @@ GRAY = "\033[90m"
 RED = "\033[31m"
 WHITE = "\033[37m"
 
-RE_URL = re.compile(r"^URL:\s*(.+)$", re.MULTILINE)
 RE_FECHA = re.compile(r"^Fecha:\s*(.+)$", re.MULTILINE)
+RE_URL = re.compile(r"^URL:\s*(.+)$", re.MULTILINE)
 RE_TIMEOUT = re.compile(r"^TIMEOUT:", re.MULTILINE)
 
 # Regex para extraer URLs específicas dentro del texto del error (ej. for 'https://...')
@@ -136,7 +136,7 @@ def analizar_logs():
         try:
             sesiones = parsear_log(log_path)
         except Exception as e:
-            print(f"  {YELLOW}⚠ Error leyendo {log_path.name}: {e}{RESET}")
+            print(f"  {YELLOW}[!] Error leyendo {log_path.name}: {e}{RESET}")
             continue
 
         if sesiones:
@@ -199,21 +199,21 @@ def imprimir_reporte(
     print(f"{BOLD}{'═' * ancho}{RESET}\n")
 
     print(f"{BOLD}  LOGS ANALIZADOS: {total_logs}{RESET}")
-    print(f"  {GREEN}✓ Sin problemas:        {len(sin_problemas)}{RESET}")
+    print(f"  {GREEN}[+] Sin problemas:        {len(sin_problemas)}{RESET}")
     print(
-        f"  {YELLOW}⚠ Errores Recuperables: {len([h for h in con_errores if h[2]])}{RESET}"
+        f"  {YELLOW}[!] Errores Recuperables: {len([h for h in con_errores if h[2]])}{RESET}"
     )
     print(
-        f"  {RED}✖ Errores Fatales:      {len([h for h in con_errores if not h[2]])}{RESET}"
+        f"  {RED}[X] Errores Fatales:      {len([h for h in con_errores if not h[2]])}{RESET}"
     )
-    print(f"  {RED}⏱ Con Timeout:          {len(con_timeout)}{RESET}")
+    print(f"  {RED}[TIMEOUT] Con Timeout:          {len(con_timeout)}{RESET}")
 
     if con_errores:
         print(f"\n{BOLD}  DIAGNÓSTICO FORENSE DE ERRORES:{RESET}")
         for nombre, sesion, es_recuperable, diagnostico in con_errores:
             color = YELLOW if es_recuperable else RED
-            marca = "↺ [RECUPERABLE]" if es_recuperable else "✖ [FATAL - DESCARTADO]"
-            print(f"\n  {color}▸ {nombre} — {marca}{RESET}")
+            marca = "[RETRY]" if es_recuperable else "[X] [FATAL - DESCARTADO]"
+            print(f"\n  {color}-> {nombre} — {marca}{RESET}")
             print(f"    {GRAY}Diagnóstico: {diagnostico}{RESET}")
             print(f"    {GRAY}URL Hilo:    {sesion['url']}{RESET}")
             for err in sesion["errores"][:3]:
@@ -222,7 +222,7 @@ def imprimir_reporte(
     if con_timeout:
         print(f"\n{BOLD}  HILOS CON TIMEOUT (SIEMPRE RECUPERABLES):{RESET}")
         for nombre, sesion in con_timeout:
-            print(f"  {YELLOW}▸ {nombre} — ↺ [TIMEOUT]{RESET}")
+            print(f"  {YELLOW}-> {nombre} — [RETRY] [TIMEOUT]{RESET}")
             print(f"    {GRAY}{sesion['url']}{RESET}")
 
     print(f"\n{BOLD}{'─' * ancho}{RESET}")
@@ -238,7 +238,7 @@ def imprimir_reporte(
                 if p["tam"] > 1024 * 1024
                 else f"{p['tam'] / 1024:.1f} KB"
             )
-            print(f"  {YELLOW}▸ {p['nombre']}{RESET} {GRAY}({tam_str}){RESET}")
+            print(f"  {YELLOW}-> {p['nombre']}{RESET} {GRAY}({tam_str}){RESET}")
 
     if not parts_mapeados and not parts_sin_mapear:
         print(f"  {GREEN}No se encontraron archivos .part{RESET}")
@@ -287,8 +287,8 @@ if __name__ == "__main__":
             continue
 
         if sesion["errores"]:
-            es_recuperable = False
-            diagnostico = "Error Desconocido / No clasificado"
+            es_recuperable = True
+            diagnostico = "RECUPERABLE: Error desconocido / No clasificado (Reintento por precaución)"
 
             # Buscaremos si alguna línea expone una URL específica caída
             url_problematica = "No especificada en el log"
@@ -382,10 +382,12 @@ if __name__ == "__main__":
                     os.remove(os.path.join(LOG_DIR, filename))
 
                 print(
-                    f"  {GRAY}Refactor completo: logs comprimidos y carpeta principal despejada con mapeo de URLs. 🧹{RESET}\n"
+                    f"  {GRAY}Refactor completo: logs comprimidos y carpeta principal despejada con mapeo de URLs. {RESET}\n"
                 )
             except Exception as e:
-                print(f"  {RED}⚠ Error crítico en la compresión del ZIP: {e}{RESET}\n")
+                print(
+                    f"  {RED}[!] Error crítico en la compresión del ZIP: {e}{RESET}\n"
+                )
 
     if IS_WINDOWS:
         input("Presiona Enter para cerrar...")
