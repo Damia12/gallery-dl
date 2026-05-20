@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 r"""
-auditar.py — Analiza logs de descarga, detecta .part huérfanos y genera lista_retry.txt
+auditar.py — Analiza logs de descarga, detecta .part huérfanos, genera lista_retry.txt
+aplicando discriminación de errores y extrayendo la URL específica del fallo.
+
 Uso: python auditar.py [--rips-dir G:/Rips]
 """
 
+import csv
 import os
 import re
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +27,9 @@ else:
     RETRY_FILE = os.path.expanduser("~/gallery-dl/lista_retry.txt")
     LISTA = os.path.expanduser("~/gallery-dl/lista.txt")
 
+# Archivo acumulativo de auditoría
+CSV_HISTORIAL = os.path.join(LOG_DIR, "historial_fallos.csv")
+
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -37,6 +44,18 @@ RE_URL = re.compile(r"^URL:\s*(.+)$", re.MULTILINE)
 RE_FECHA = re.compile(r"^Fecha:\s*(.+)$", re.MULTILINE)
 RE_TIMEOUT = re.compile(r"^TIMEOUT:", re.MULTILINE)
 
+# Regex para extraer URLs específicas dentro del texto del error (ej. for 'https://...')
+RE_EXTRAER_URL = re.compile(r"for\s+'([^']+)'")
+
+ERRORES_FATALES = ["404 not found", "unsupported url", "thread deleted", "410 gone"]
+ERRORES_TRANSITORIOS = [
+    "502 bad gateway",
+    "504 gateway",
+    "500 internal",
+    "html response",
+    "timed out",
+    "connection reset",
+]
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -45,11 +64,12 @@ def leer_lista(path):
     if not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as f:
-        return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        return [
+            linea.strip() for linea in f if linea.strip() and not linea.startswith("#")
+        ]
 
 
 def cargar_urls_lista():
-    """Lee lista.txt para poder mapear nombre → URL."""
     urls = leer_lista(LISTA)
     mapa = {}
     for url in urls:
@@ -58,15 +78,13 @@ def cargar_urls_lista():
     return mapa
 
 
-# ── Análisis de logs ──────────────────────────────────────────────────────────
+# ── Análisis Forense de Logs ──────────────────────────────────────────────────
 
 
 def parsear_log(log_path):
-    """Parsea un archivo .log y devuelve lista de sesiones con sus datos."""
     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
         contenido = f.read()
 
-    # Dividir por bloques de sesión (separados por ====)
     bloques = re.split(r"={10,}", contenido)
     sesiones = []
 
@@ -79,7 +97,6 @@ def parsear_log(log_path):
         fecha_match = RE_FECHA.search(bloque)
         timeout = bool(RE_TIMEOUT.search(bloque))
 
-        # Parseo robusto de errores: captura todas las líneas después de "ERRORES:"
         errores = []
         en_bloque_errores = False
         for linea in bloque.splitlines():
@@ -97,19 +114,13 @@ def parsear_log(log_path):
 
         if url:
             sesiones.append(
-                {
-                    "url": url,
-                    "fecha": fecha,
-                    "timeout": timeout,
-                    "errores": errores,
-                }
+                {"url": url, "fecha": fecha, "timeout": timeout, "errores": errores}
             )
 
     return sesiones
 
 
 def analizar_logs():
-    """Escanea todos los .log y agrupa por URL la última sesión."""
     if not os.path.exists(LOG_DIR):
         print(f"  {RED}No se encontró el directorio de logs: {LOG_DIR}{RESET}")
         return {}
@@ -119,8 +130,7 @@ def analizar_logs():
         print(f"  {GRAY}No hay archivos .log en {LOG_DIR}{RESET}")
         return {}
 
-    resultados = {}  # nombre_log → última sesión
-
+    resultados = {}
     for log_path in logs:
         nombre = log_path.stem
         try:
@@ -129,21 +139,16 @@ def analizar_logs():
             print(f"  {YELLOW}⚠ Error leyendo {log_path.name}: {e}{RESET}")
             continue
 
-        if not sesiones:
-            continue
-
-        # Quedarse con la última sesión de cada log
-        ultima = sesiones[-1]
-        resultados[nombre] = ultima
+        if sesiones:
+            resultados[nombre] = sesiones[-1]
 
     return resultados
 
 
-# ── Detección de .part huérfanos ──────────────────────────────────────────────
+# ── Detección de .part Huérfanos ──────────────────────────────────────────────
 
 
 def buscar_parts(rips_dir):
-    """Busca archivos .part recursivamente en el directorio de rips."""
     parts = []
     for root, _, files in os.walk(rips_dir):
         for fname in files:
@@ -155,12 +160,10 @@ def buscar_parts(rips_dir):
 
 
 def mapear_parts_a_urls(parts, mapa_urls):
-    """Intenta mapear cada .part a una URL conocida por la carpeta padre."""
     mapeados = []
     sin_mapear = []
 
     for p in parts:
-        # Buscar si algún segmento del path coincide con un nombre de thread conocido
         partes_ruta = Path(p["ruta"]).parts
         url_encontrada = None
         for segmento in partes_ruta:
@@ -177,10 +180,17 @@ def mapear_parts_a_urls(parts, mapa_urls):
     return mapeados, sin_mapear
 
 
-# ── Reporte ───────────────────────────────────────────────────────────────────
+# ── Reporte Visual ───────────────────────────────────────────────────────────
 
 
-def imprimir_reporte(resultados_logs, parts_mapeados, parts_sin_mapear, urls_retry):
+def imprimir_reporte(
+    con_errores,
+    con_timeout,
+    sin_problemas,
+    parts_mapeados,
+    parts_sin_mapear,
+    total_logs,
+):
     ancho = 56
     print(f"\n{BOLD}{'═' * ancho}{RESET}")
     print(
@@ -188,40 +198,33 @@ def imprimir_reporte(resultados_logs, parts_mapeados, parts_sin_mapear, urls_ret
     )
     print(f"{BOLD}{'═' * ancho}{RESET}\n")
 
-    # ── Resumen de logs
-    con_errores = [(n, s) for n, s in resultados_logs.items() if s["errores"]]
-    con_timeout = [(n, s) for n, s in resultados_logs.items() if s["timeout"]]
-    sin_problemas = [
-        (n, s)
-        for n, s in resultados_logs.items()
-        if not s["errores"] and not s["timeout"]
-    ]
-
-    print(f"{BOLD}  LOGS ANALIZADOS: {len(resultados_logs)}{RESET}")
-    print(f"  {GREEN}✓ Sin problemas:  {len(sin_problemas)}{RESET}")
-    print(f"  {YELLOW}⚠ Con errores:    {len(con_errores)}{RESET}")
-    print(f"  {RED}⏱ Con timeout:    {len(con_timeout)}{RESET}")
+    print(f"{BOLD}  LOGS ANALIZADOS: {total_logs}{RESET}")
+    print(f"  {GREEN}✓ Sin problemas:        {len(sin_problemas)}{RESET}")
+    print(
+        f"  {YELLOW}⚠ Errores Recuperables: {len([h for h in con_errores if h[2]])}{RESET}"
+    )
+    print(
+        f"  {RED}✖ Errores Fatales:      {len([h for h in con_errores if not h[2]])}{RESET}"
+    )
+    print(f"  {RED}⏱ Con Timeout:          {len(con_timeout)}{RESET}")
 
     if con_errores:
-        print(f"\n{BOLD}  HILOS CON ERRORES:{RESET}")
-        for nombre, sesion in con_errores:
-            print(f"\n  {YELLOW}▸ {nombre}{RESET}")
-            print(f"    {GRAY}URL:   {sesion['url']}{RESET}")
-            print(f"    {GRAY}Fecha: {sesion['fecha']}{RESET}")
-            for err in sesion["errores"][:5]:
+        print(f"\n{BOLD}  DIAGNÓSTICO FORENSE DE ERRORES:{RESET}")
+        for nombre, sesion, es_recuperable, diagnostico in con_errores:
+            color = YELLOW if es_recuperable else RED
+            marca = "↺ [RECUPERABLE]" if es_recuperable else "✖ [FATAL - DESCARTADO]"
+            print(f"\n  {color}▸ {nombre} — {marca}{RESET}")
+            print(f"    {GRAY}Diagnóstico: {diagnostico}{RESET}")
+            print(f"    {GRAY}URL Hilo:    {sesion['url']}{RESET}")
+            for err in sesion["errores"][:3]:
                 print(f"    {RED}· {err}{RESET}")
-            if len(sesion["errores"]) > 5:
-                print(
-                    f"    {DIM}  ... y {len(sesion['errores']) - 5} errores más (ver log){RESET}"
-                )
 
     if con_timeout:
-        print(f"\n{BOLD}  HILOS CON TIMEOUT:{RESET}")
+        print(f"\n{BOLD}  HILOS CON TIMEOUT (SIEMPRE RECUPERABLES):{RESET}")
         for nombre, sesion in con_timeout:
-            print(f"  {RED}▸ {nombre}{RESET}")
+            print(f"  {YELLOW}▸ {nombre} — ↺ [TIMEOUT]{RESET}")
             print(f"    {GRAY}{sesion['url']}{RESET}")
 
-    # ── .part huérfanos
     print(f"\n{BOLD}{'─' * ancho}{RESET}")
     print(
         f"{BOLD}  ARCHIVOS .PART HUÉRFANOS: {len(parts_mapeados) + len(parts_sin_mapear)}{RESET}"
@@ -230,41 +233,15 @@ def imprimir_reporte(resultados_logs, parts_mapeados, parts_sin_mapear, urls_ret
     if parts_mapeados:
         print(f"\n  {YELLOW}Mapeados a URL conocida ({len(parts_mapeados)}):{RESET}")
         for p in parts_mapeados:
-            tam_kb = p["tam"] / 1024
-            tam_str = f"{tam_kb:.1f} KB" if tam_kb < 1024 else f"{tam_kb / 1024:.1f} MB"
+            tam_str = (
+                f"{p['tam'] / 1024 / 1024:.1f} MB"
+                if p["tam"] > 1024 * 1024
+                else f"{p['tam'] / 1024:.1f} KB"
+            )
             print(f"  {YELLOW}▸ {p['nombre']}{RESET} {GRAY}({tam_str}){RESET}")
-            print(f"    {GRAY}{p['ruta']}{RESET}")
-
-    if parts_sin_mapear:
-        print(
-            f"\n  {DIM}Sin URL conocida ({len(parts_sin_mapear)}) — solo reporte:{RESET}"
-        )
-        for p in parts_sin_mapear:
-            tam_kb = p["tam"] / 1024
-            tam_str = f"{tam_kb:.1f} KB" if tam_kb < 1024 else f"{tam_kb / 1024:.1f} MB"
-            print(f"  {DIM}▸ {p['nombre']} ({tam_str}){RESET}")
-            print(f"    {GRAY}{p['ruta']}{RESET}")
 
     if not parts_mapeados and not parts_sin_mapear:
         print(f"  {GREEN}No se encontraron archivos .part{RESET}")
-
-    # ── URLs agregadas a retry
-    print(f"\n{BOLD}{'─' * ancho}{RESET}")
-    print(f"{BOLD}  LISTA_RETRY.TXT{RESET}")
-    if urls_retry:
-        print(f"  {YELLOW}→ {len(urls_retry)} URLs agregadas:{RESET}")
-        for url in urls_retry:
-            print(f"    {GRAY}{url}{RESET}")
-    else:
-        print(f"  {GREEN}No hay URLs nuevas para agregar{RESET}")
-
-    # Total en retry
-    total_retry = leer_lista(RETRY_FILE)
-    if total_retry:
-        print(f"\n  {BOLD}Total en lista_retry.txt: {len(total_retry)}{RESET}")
-        print(
-            f"  {DIM}Corré: python descarga.py (con lista_retry.txt como LISTA) para procesarlas{RESET}"
-        )
 
     print(f"\n{BOLD}{'═' * ancho}{RESET}\n")
 
@@ -272,7 +249,6 @@ def imprimir_reporte(resultados_logs, parts_mapeados, parts_sin_mapear, urls_ret
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Soporte para --rips-dir personalizado
     rips_dir = RIPS_DIR
     if "--rips-dir" in sys.argv:
         idx = sys.argv.index("--rips-dir")
@@ -280,62 +256,136 @@ if __name__ == "__main__":
             rips_dir = sys.argv[idx + 1]
 
     print(f"{BOLD}{'═' * 56}{RESET}")
-    print(f"{BOLD}  Auditando logs en: {LOG_DIR}{RESET}")
-    print(f"{BOLD}  Buscando .part en: {rips_dir}{RESET}")
+    print(f"  Auditando logs en: {LOG_DIR}")
+    print(f"  Buscando .part en: {rips_dir}")
     print(f"{BOLD}{'═' * 56}{RESET}\n")
 
-    # 1. Analizar logs
-    print(f"  {DIM}Analizando logs...{RESET}")
     resultados_logs = analizar_logs()
-
-    # 2. Detectar .part
-    print(f"  {DIM}Buscando archivos .part...{RESET}")
     parts = buscar_parts(rips_dir)
     mapa_urls = cargar_urls_lista()
     parts_mapeados, parts_sin_mapear = mapear_parts_a_urls(parts, mapa_urls)
 
-    # 3. Determinar URLs para retry
+    sin_problemas = []
+    con_timeout = []
+    con_errores = []
+
     urls_para_retry = []
+    csv_rows_nuevas = []
+    ahora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for nombre, sesion in resultados_logs.items():
-        if sesion["errores"] or sesion["timeout"]:
-            urls_para_retry.append(sesion["url"])
+        if not sesion["errores"] and not sesion["timeout"]:
+            sin_problemas.append((nombre, sesion))
+            continue
 
-    # --- CORRECCIÓN AQUÍ ---
+        if sesion["timeout"]:
+            con_timeout.append((nombre, sesion))
+            urls_para_retry.append(sesion["url"])
+            csv_rows_nuevas.append(
+                [ahora_str, nombre, "TIMEOUT_ACTIVIDAD", sesion["url"], "N/A"]
+            )
+            continue
+
+        if sesion["errores"]:
+            es_recuperable = False
+            diagnostico = "Error Desconocido / No clasificado"
+
+            # Buscaremos si alguna línea expone una URL específica caída
+            url_problematica = "No especificada en el log"
+
+            for err in sesion["errores"]:
+                err_lower = err.lower()
+
+                # Intentar extraer la URL específica de este error (ej: Bunkr o Gofile directo)
+                match_url = RE_EXTRAER_URL.search(err)
+                if match_url:
+                    url_problematica = match_url.group(1)
+
+                if any(f in err_lower for f in ERRORES_FATALES):
+                    es_recuperable = False
+                    diagnostico = "FATAL: Enlace caído, borrado o URL no soportada (404/Unsupported)"
+                    break  # Prioridad fatal de descarte
+
+                elif any(t in err_lower for t in ERRORES_TRANSITORIOS):
+                    es_recuperable = True
+                    diagnostico = "RECUPERABLE: Sobrecarga transitoria del servidor externo (502/504/HTML-Response)"
+
+            con_errores.append((nombre, sesion, es_recuperable, diagnostico))
+
+            tipo_csv = (
+                f"TRANSITORIO ({diagnostico.split(': ')[0]})"
+                if es_recuperable
+                else f"FATAL ({diagnostico.split(': ')[0]})"
+            )
+            if es_recuperable:
+                urls_para_retry.append(sesion["url"])
+
+            csv_rows_nuevas.append(
+                [ahora_str, nombre, tipo_csv, sesion["url"], url_problematica]
+            )
+
     for p in parts_mapeados:
         if p["url"] not in urls_para_retry:
             urls_para_retry.append(p["url"])
-    # ------------------------
 
-    # 4. Escribir lista_retry.txt si hay fallos
     if urls_para_retry:
         with open(RETRY_FILE, "w", encoding="utf-8") as f:
             for url in urls_para_retry:
                 f.write(url + "\n")
+    else:
+        if os.path.exists(RETRY_FILE):
+            os.remove(RETRY_FILE)
 
-    # 5. Imprimir el reporte visual en la terminal
-    imprimir_reporte(resultados_logs, parts_mapeados, parts_sin_mapear, urls_para_retry)
+    # Escritura en CSV con la nueva columna 'URL_Problematica'
+    if csv_rows_nuevas:
+        existe_csv = os.path.exists(CSV_HISTORIAL)
+        with open(CSV_HISTORIAL, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f, delimiter=";")
+            if not existe_csv:
+                writer.writerow(
+                    [
+                        "Fecha_Registro",
+                        "Hilo",
+                        "Tipo_Fallo",
+                        "URL_Hilo_Simpcity",
+                        "URL_Problematica_Directa",
+                    ]
+                )
+            writer.writerows(csv_rows_nuevas)
 
-    # 6. ── NUEVA LÓGICA DE AUTO-ARCHIVADO DE LOGS ──
+    imprimir_reporte(
+        con_errores,
+        con_timeout,
+        sin_problemas,
+        parts_mapeados,
+        parts_sin_mapear,
+        len(resultados_logs),
+    )
+
     if resultados_logs:
         archivo_dir = os.path.join(LOG_DIR, "archivo")
         os.makedirs(archivo_dir, exist_ok=True)
 
-        # Movemos los archivos analizados para dejar la carpeta logs limpia y fresca
-        for filename in os.listdir(LOG_DIR):
-            if filename.endswith(".log"):
-                ruta_original = os.path.join(LOG_DIR, filename)
-                ruta_destino = os.path.join(archivo_dir, filename)
-                try:
-                    # Si el archivo de destino ya existe, lo removemos antes de mover
-                    if os.path.exists(ruta_destino):
-                        os.remove(ruta_destino)
-                    os.rename(ruta_original, ruta_destino)
-                except OSError:
-                    pass
-        print(
-            f"  {GRAY}🧹 Logs analizados movidos a la carpeta '\\logs\\archivo\\'. Carpeta principal limpia.{RESET}\n"
-        )
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        zip_path = os.path.join(archivo_dir, f"sesion_{stamp}.zip")
+        logs_a_empaquetar = [f for f in os.listdir(LOG_DIR) if f.endswith(".log")]
+
+        if logs_a_empaquetar:
+            print(f"  {DIM}Empaquetando logs en {Path(zip_path).name}...{RESET}")
+            try:
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                    for filename in logs_a_empaquetar:
+                        ruta_original = os.path.join(LOG_DIR, filename)
+                        zipf.write(ruta_original, filename)
+
+                for filename in logs_a_empaquetar:
+                    os.remove(os.path.join(LOG_DIR, filename))
+
+                print(
+                    f"  {GRAY}Refactor completo: logs comprimidos y carpeta principal despejada con mapeo de URLs. 🧹{RESET}\n"
+                )
+            except Exception as e:
+                print(f"  {RED}⚠ Error crítico en la compresión del ZIP: {e}{RESET}\n")
 
     if IS_WINDOWS:
         input("Presiona Enter para cerrar...")
