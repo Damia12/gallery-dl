@@ -20,14 +20,20 @@ if IS_WINDOWS:
     CONFIG = r"C:\gallery-dl\gallery-dl_win.conf"
     LISTA = r"C:\gallery-dl\lista.txt"
     LOG_DIR = r"G:\Rips\logs"
+    RETRY_FILE = r"C:\gallery-dl\lista_retry.txt"
+    BACKUP_FILE = r"C:\gallery-dl\lista_retry_backup.txt"
 else:
     GALLERY_DL = "gallery-dl"
     CONFIG = os.path.expanduser("~/gallery-dl/gallery-dl_linux.conf")
     LISTA = os.path.expanduser("~/gallery-dl/lista.txt")
     LOG_DIR = os.path.expanduser("~/Rips/logs")
+    RETRY_FILE = os.path.expanduser("~/gallery-dl/lista_retry.txt")
+    BACKUP_FILE = os.path.expanduser("~/gallery-dl/lista_retry_backup.txt")
 
 SLEEP_ENTRE_HILOS = 30
 TIMEOUT_ACTIVIDAD = 300
+TIMEOUT_SIN_ARCHIVOS = 600
+MAX_REINTENTOS = 2
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -122,7 +128,6 @@ def spinner_thread_windows(estado, lock_print):
 
         barra_visual = f"{DIM}│{RESET}{ACCENT}{barra_interna}{RESET}{DIM}│{RESET}"
 
-        # Usamos el lock para asegurar que la animación no choque con los prints principales
         with lock_print:
             sys.stdout.write(
                 f"\r  {ACCENT}{SPINNER[idx % len(SPINNER)]}{RESET} {barra_visual} {DIM}{resumen} — {tiempo}{RESET}\033[K"
@@ -136,7 +141,12 @@ def spinner_thread_windows(estado, lock_print):
 
 def watchdog_thread(proceso, estado, timeout):
     while not estado["stop"]:
-        if time.time() - estado["ultimo_output"] > timeout:
+        ahora = time.time()
+        if ahora - estado["ultimo_output"] > timeout:
+            proceso.kill()
+            estado["timeout"] = True
+            break
+        if ahora - estado["ultimo_archivo"] > TIMEOUT_SIN_ARCHIVOS:
             proceso.kill()
             estado["timeout"] = True
             break
@@ -158,10 +168,8 @@ def limpiar_error(linea):
     return re.sub(r"^\[gallery-dl\]\s*", "", linea).strip()
 
 
-def descargar_windows(url, reset_archive):
+def descargar_windows(url):
     cmd = [GALLERY_DL, "-c", CONFIG, url]
-    if reset_archive:
-        cmd.append("--no-download-archive")
 
     inicio = time.time()
     archivos_nuevos = []
@@ -171,7 +179,12 @@ def descargar_windows(url, reset_archive):
     contador = {"seq": 0}
 
     estado_spinner = {"stop": False, "inicio": inicio, "nuevo": 0, "done": 0}
-    estado_watchdog = {"stop": False, "ultimo_output": time.time(), "timeout": False}
+    estado_watchdog = {
+        "stop": False,
+        "ultimo_output": time.time(),
+        "ultimo_archivo": time.time(),
+        "timeout": False,
+    }
 
     sys.stdout.write("\033[?25l")
     sys.stdout.flush()
@@ -200,7 +213,6 @@ def descargar_windows(url, reset_archive):
                 )
                 sys.stdout.flush()
 
-    # Pasamos lock_print al spinner para sincronización nativa
     spin = threading.Thread(
         target=spinner_thread_windows, args=(estado_spinner, lock_print), daemon=True
     )
@@ -227,6 +239,7 @@ def descargar_windows(url, reset_archive):
 
                 if linea_strip.startswith("#"):
                     estado_spinner["done"] += 1
+                    estado_watchdog["ultimo_archivo"] = time.time()
                     contador["seq"] += 1
                     ruta = linea_strip[1:].strip()
                     print(
@@ -234,6 +247,7 @@ def descargar_windows(url, reset_archive):
                     )
                 else:
                     estado_spinner["nuevo"] += 1
+                    estado_watchdog["ultimo_archivo"] = time.time()
                     contador["seq"] += 1
                     archivos_nuevos.append(linea_strip)
                     print(
@@ -261,10 +275,8 @@ def descargar_windows(url, reset_archive):
     )
 
 
-def descargar_linux(url, reset_archive):
+def descargar_linux(url):
     cmd = [GALLERY_DL, "-c", CONFIG, url]
-    if reset_archive:
-        cmd.append("--no-download-archive")
 
     inicio = time.time()
     archivos_nuevos = []
@@ -274,6 +286,7 @@ def descargar_linux(url, reset_archive):
     contador_seq = 0
     ultima_ruta = ""
     timeout_ocurrido = False
+    ultimo_archivo = time.time()
 
     env_vars = os.environ.copy()
     env_vars["PYTHONUNBUFFERED"] = "1"
@@ -295,7 +308,12 @@ def descargar_linux(url, reset_archive):
             r, _, _ = select.select([master_fd], [], [], 1.0)
 
             if not r:
-                if time.time() - ultimo_output > TIMEOUT_ACTIVIDAD:
+                ahora = time.time()
+                if ahora - ultimo_output > TIMEOUT_ACTIVIDAD:
+                    proceso.kill()
+                    timeout_ocurrido = True
+                    break
+                if ahora - ultimo_archivo > TIMEOUT_SIN_ARCHIVOS:
                     proceso.kill()
                     timeout_ocurrido = True
                     break
@@ -364,8 +382,9 @@ def descargar_linux(url, reset_archive):
                         continue
 
                     es_done = "\x1b[2m" in linea_limpia
+                    es_error = es_linea_error(linea_limpia)
+
                     linea_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
-                    es_error = es_linea_error(linea_pura)
 
                     if not linea_pura:
                         continue
@@ -380,6 +399,7 @@ def descargar_linux(url, reset_archive):
 
                     if es_done:
                         contador_done += 1
+                        ultimo_archivo = time.time()
                         sys.stdout.write(
                             f"\r\033[2K  {DIM}[{contador_seq:>3}] [DONE] {nombre_visible_str}{RESET}\n"
                         )
@@ -390,6 +410,7 @@ def descargar_linux(url, reset_archive):
                         )
                     else:
                         contador_nuevo += 1
+                        ultimo_archivo = time.time()
                         archivos_nuevos.append(linea_pura)
                         sys.stdout.write(
                             f"\r\033[2K  {GREEN}[{contador_seq:>3}] {nombre_visible_str}{RESET}\n"
@@ -418,25 +439,102 @@ def descargar_linux(url, reset_archive):
     )
 
 
-if __name__ == "__main__":
-    reset_archive = "--reset" in sys.argv
-    if reset_archive:
-        sys.argv.remove("--reset")
+def ejecutar_con_reintentos(url, intento=1):
+    """Ejecuta la descarga con hasta MAX_REINTENTOS reintentos si hay errores."""
+    if intento > 1:
+        print(f"  {YELLOW}↺ Reintento {intento - 1}/{MAX_REINTENTOS}{RESET}\n")
 
-    if len(sys.argv) > 1:
-        urls = sys.argv[1:]
+    if IS_WINDOWS:
+        return descargar_windows(url)
     else:
-        with open(LISTA, "r", encoding="utf-8") as f:
+        return descargar_linux(url)
+
+
+def guardar_retry(url):
+    """Agrega una URL al archivo de reintentos si no está ya."""
+    existentes = set()
+    if os.path.exists(RETRY_FILE):
+        with open(RETRY_FILE, "r", encoding="utf-8") as f:
+            existentes = {l.strip() for l in f if l.strip() and not l.startswith("#")}
+
+    if url not in existentes:
+        with open(RETRY_FILE, "a", encoding="utf-8") as f:
+            f.write(url + "\n")
+
+
+def elegir_lista():
+    """Pregunta interactivamente qué lista usar si no se pasaron argumentos."""
+    tiene_retry = os.path.exists(RETRY_FILE) and any(
+        l.strip() for l in open(RETRY_FILE, encoding="utf-8") if not l.startswith("#")
+    )
+
+    print(f"  {CYAN}[1]{RESET} lista.txt          {GRAY}(descarga normal){RESET}")
+
+    if tiene_retry:
+        retry_count = sum(
+            1
+            for l in open(RETRY_FILE, encoding="utf-8")
+            if l.strip() and not l.startswith("#")
+        )
+        print(
+            f"  {YELLOW}[2]{RESET} lista_retry.txt    {GRAY}({retry_count} URLs pendientes){RESET}"
+        )
+    else:
+        print(f"  {DIM}[2] lista_retry.txt  (vacía o inexistente){RESET}")
+
+    print()
+
+    while True:
+        try:
+            opcion = input(f"  Opción {CYAN}[1/2]{RESET}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        if opcion == "1":
+            return LISTA
+        elif opcion == "2":
+            if not tiene_retry:
+                print(f"  {RED}lista_retry.txt está vacía o no existe.{RESET}")
+                continue
+            return RETRY_FILE
+        else:
+            print(f"  {YELLOW}Ingresá 1 o 2.{RESET}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if os.path.isfile(arg):
+            with open(arg, "r", encoding="utf-8") as f:
+                urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
+        else:
+            urls = sys.argv[1:]
+    else:
+        print(f"{BOLD}{'═' * 50}{RESET}")
+        print(
+            f"{BOLD}  Iniciando descarga ({'Windows' if IS_WINDOWS else 'Linux/WSL'}) — seleccioná lista{RESET}"
+        )
+        print(f"{BOLD}{'═' * 50}{RESET}\n")
+        archivo = elegir_lista()
+        with open(archivo, "r", encoding="utf-8") as f:
             urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
 
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
         f"{BOLD}  Iniciando descarga — {len(urls)} hilos ({'Windows' if IS_WINDOWS else 'Linux/WSL'}){RESET}"
     )
-    if reset_archive:
-        print(f"  {YELLOW}Modo: ignorando archive{RESET}")
     print(f"  {GRAY}{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
     print(f"{BOLD}{'═' * 50}{RESET}\n")
+
+    # Limpiar logs del run anterior
+    if os.path.exists(LOG_DIR):
+        for f_log in os.listdir(LOG_DIR):
+            if f_log.endswith(".log"):
+                try:
+                    os.remove(os.path.join(LOG_DIR, f_log))
+                except OSError:
+                    pass
 
     errores_totales = []
     timeouts_totales = []
@@ -448,14 +546,35 @@ if __name__ == "__main__":
         print(f"{BOLD}[{i}/{len(urls)}]{RESET} {CYAN}{nombre}{RESET}")
         print(f"  {GRAY}{url}{RESET}\n")
 
-        if IS_WINDOWS:
-            archivos, errs, nuevos, done, timeout, duracion = descargar_windows(
-                url, reset_archive
-            )
-        else:
-            archivos, errs, nuevos, done, timeout, duracion = descargar_linux(
-                url, reset_archive
-            )
+        archivos, errs, nuevos, done, timeout, duracion = ejecutar_con_reintentos(
+            url, intento=1
+        )
+
+        # Reintentos automáticos si hubo errores
+        if errs and not timeout:
+            for reintento in range(2, MAX_REINTENTOS + 2):
+                print(f"\n  {YELLOW}⚠ {len(errs)} errores detectados{RESET}")
+                time.sleep(SLEEP_ENTRE_HILOS)
+                archivos2, errs2, nuevos2, done2, timeout2, duracion2 = (
+                    ejecutar_con_reintentos(url, intento=reintento)
+                )
+
+                # Acumular resultados
+                archivos += archivos2
+                nuevos += nuevos2
+                done += done2
+                duracion += duracion2
+
+                if not errs2 or timeout2:
+                    errs = errs2
+                    timeout = timeout2
+                    break
+                errs = errs2
+                timeout = timeout2
+
+        # Si tras los reintentos sigue con errores o timeout, anotar para auditar
+        if errs or timeout:
+            guardar_retry(url)
 
         if timeout:
             timeouts_totales.append(nombre)
@@ -524,7 +643,37 @@ if __name__ == "__main__":
             print(f"    {n}")
     if not errores_totales and not timeouts_totales:
         print(f"  {GREEN}Todos los hilos sin errores.{RESET}")
+    else:
+        retry_pendientes = 0
+        if os.path.exists(RETRY_FILE):
+            with open(RETRY_FILE, "r", encoding="utf-8") as f:
+                retry_pendientes = sum(
+                    1 for l in f if l.strip() and not l.startswith("#")
+                )
+        if retry_pendientes:
+            print(
+                f"\n  {YELLOW}→ {retry_pendientes} URLs en lista_retry.txt — corré auditar.py para analizarlas{RESET}"
+            )
     print(f"{BOLD}{'═' * 50}{RESET}")
+
+    # Si se procesó lista_retry.txt → backup y borrar
+    if os.path.exists(RETRY_FILE):
+        urls_retry_procesadas = [
+            u.strip()
+            for u in open(RETRY_FILE, encoding="utf-8")
+            if u.strip() and not u.startswith("#")
+        ]
+        if urls_retry_procesadas and es_retry_run:
+            fecha_backup = datetime.now().strftime("%Y-%m-%d %H:%M")
+            with open(BACKUP_FILE, "a", encoding="utf-8") as fb:
+                fb.write(f"# {fecha_backup}\n")
+                for u in urls_retry_procesadas:
+                    fb.write(u + "\n")
+                fb.write("\n")
+            os.remove(RETRY_FILE)
+            print(
+                f"  {DIM}lista_retry.txt procesada y vaciada — backup en lista_retry_backup.txt{RESET}"
+            )
 
     if IS_WINDOWS:
         input("\nPresiona Enter para cerrar...")
