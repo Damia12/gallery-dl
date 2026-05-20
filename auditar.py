@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 auditar.py — Analiza logs de descarga, detecta .part huérfanos y genera lista_retry.txt
 Uso: python auditar.py [--rips-dir G:/Rips]
 """
@@ -36,7 +36,6 @@ WHITE = "\033[37m"
 RE_URL = re.compile(r"^URL:\s*(.+)$", re.MULTILINE)
 RE_FECHA = re.compile(r"^Fecha:\s*(.+)$", re.MULTILINE)
 RE_TIMEOUT = re.compile(r"TIMEOUT", re.MULTILINE)
-RE_ERRORES = re.compile(r"^ERRORES:\n((?:.+\n?)+)", re.MULTILINE)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -96,17 +95,22 @@ def parsear_log(log_path):
         url_match = RE_URL.search(bloque)
         fecha_match = RE_FECHA.search(bloque)
         timeout = bool(RE_TIMEOUT.search(bloque))
-        errores_match = RE_ERRORES.search(bloque)
+
+        # Parseo robusto de errores: captura todas las líneas después de "ERRORES:"
+        errores = []
+        en_bloque_errores = False
+        for linea in bloque.splitlines():
+            if linea.strip() == "ERRORES:":
+                en_bloque_errores = True
+                continue
+            if en_bloque_errores:
+                if linea.strip():
+                    errores.append(linea.strip())
+                else:
+                    en_bloque_errores = False
 
         url = url_match.group(1).strip() if url_match else None
         fecha = fecha_match.group(1).strip() if fecha_match else None
-        errores = []
-        if errores_match:
-            errores = [
-                e.strip()
-                for e in errores_match.group(1).strip().splitlines()
-                if e.strip()
-            ]
 
         if url:
             sesiones.append(
@@ -314,15 +318,41 @@ if __name__ == "__main__":
         if sesion["errores"] or sesion["timeout"]:
             urls_para_retry.append(sesion["url"])
 
+    # --- CORRECCIÓN AQUÍ ---
     for p in parts_mapeados:
         if p["url"] not in urls_para_retry:
             urls_para_retry.append(p["url"])
+    # ------------------------
 
-    # 4. Escribir lista_retry.txt
-    urls_agregadas = agregar_a_retry(urls_para_retry)
+    # 4. Escribir lista_retry.txt si hay fallos
+    if urls_para_retry:
+        with open(RETRY_FILE, "w", encoding="utf-8") as f:
+            for url in urls_para_retry:
+                f.write(url + "\n")
 
-    # 5. Reporte final
-    imprimir_reporte(resultados_logs, parts_mapeados, parts_sin_mapear, urls_agregadas)
+    # 5. Imprimir el reporte visual en la terminal
+    imprimir_reporte(resultados_logs, parts_mapeados, parts_sin_mapear, urls_para_retry)
+
+    # 6. ── NUEVA LÓGICA DE AUTO-ARCHIVADO DE LOGS ──
+    if resultados_logs:
+        archivo_dir = os.path.join(LOG_DIR, "archivo")
+        os.makedirs(archivo_dir, exist_ok=True)
+
+        # Movemos los archivos analizados para dejar la carpeta logs limpia y fresca
+        for filename in os.listdir(LOG_DIR):
+            if filename.endswith(".log"):
+                ruta_original = os.path.join(LOG_DIR, filename)
+                ruta_destino = os.path.join(archivo_dir, filename)
+                try:
+                    # Si el archivo de destino ya existe, lo removemos antes de mover
+                    if os.path.exists(ruta_destino):
+                        os.remove(ruta_destino)
+                    os.rename(ruta_original, ruta_destino)
+                except OSError:
+                    pass
+        print(
+            f"  {GRAY}🧹 Logs analizados movidos a la carpeta '\\logs\\archivo\\'. Carpeta principal limpia.{RESET}\n"
+        )
 
     if IS_WINDOWS:
         input("Presiona Enter para cerrar...")

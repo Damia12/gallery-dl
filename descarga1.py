@@ -450,32 +450,19 @@ def ejecutar_con_reintentos(url, intento=1):
         return descargar_linux(url)
 
 
-def guardar_retry(url):
-    """Agrega una URL al archivo de reintentos si no está ya."""
-    existentes = set()
-    if os.path.exists(RETRY_FILE):
-        with open(RETRY_FILE, "r", encoding="utf-8") as f:
-            existentes = {l.strip() for l in f if l.strip() and not l.startswith("#")}
-
-    if url not in existentes:
-        with open(RETRY_FILE, "a", encoding="utf-8") as f:
-            f.write(url + "\n")
-
-
 def elegir_lista():
     """Pregunta interactivamente qué lista usar si no se pasaron argumentos."""
-    tiene_retry = os.path.exists(RETRY_FILE) and any(
-        l.strip() for l in open(RETRY_FILE, encoding="utf-8") if not l.startswith("#")
-    )
+    tiene_retry = False
+    retry_count = 0
+    if os.path.exists(RETRY_FILE):
+        with open(RETRY_FILE, encoding="utf-8") as f:
+            lineas_retry = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        tiene_retry = bool(lineas_retry)
+        retry_count = len(lineas_retry)
 
     print(f"  {CYAN}[1]{RESET} lista.txt          {GRAY}(descarga normal){RESET}")
 
     if tiene_retry:
-        retry_count = sum(
-            1
-            for l in open(RETRY_FILE, encoding="utf-8")
-            if l.strip() and not l.startswith("#")
-        )
         print(
             f"  {YELLOW}[2]{RESET} lista_retry.txt    {GRAY}({retry_count} URLs pendientes){RESET}"
         )
@@ -503,9 +490,13 @@ def elegir_lista():
 
 
 if __name__ == "__main__":
+    es_retry_run = False  # Inicializamos el flag en falso
+
     if len(sys.argv) > 1:
         arg = sys.argv[1]
         if os.path.isfile(arg):
+            if os.path.abspath(arg) == os.path.abspath(RETRY_FILE):
+                es_retry_run = True
             with open(arg, "r", encoding="utf-8") as f:
                 urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
         else:
@@ -517,6 +508,8 @@ if __name__ == "__main__":
         )
         print(f"{BOLD}{'═' * 50}{RESET}\n")
         archivo = elegir_lista()
+        if archivo == RETRY_FILE:
+            es_retry_run = True
         with open(archivo, "r", encoding="utf-8") as f:
             urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
 
@@ -527,18 +520,8 @@ if __name__ == "__main__":
     print(f"  {GRAY}{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
     print(f"{BOLD}{'═' * 50}{RESET}\n")
 
-    # Limpiar logs del run anterior
-    if os.path.exists(LOG_DIR):
-        for f_log in os.listdir(LOG_DIR):
-            if f_log.endswith(".log"):
-                try:
-                    os.remove(os.path.join(LOG_DIR, f_log))
-                except OSError:
-                    pass
-
     errores_totales = []
     timeouts_totales = []
-
     for i, url in enumerate(urls, 1):
         nombre = url.rstrip("/").split("/")[-1][:60]
         log_file = os.path.join(LOG_DIR, f"{nombre}.log")
@@ -550,7 +533,7 @@ if __name__ == "__main__":
             url, intento=1
         )
 
-        # Reintentos automáticos si hubo errores
+        # Reintentos automáticos si hubo errores normales
         if errs and not timeout:
             for reintento in range(2, MAX_REINTENTOS + 2):
                 print(f"\n  {YELLOW}⚠ {len(errs)} errores detectados{RESET}")
@@ -572,29 +555,29 @@ if __name__ == "__main__":
                 errs = errs2
                 timeout = timeout2
 
-        # Si tras los reintentos sigue con errores o timeout, anotar para auditar
-        if errs or timeout:
-            guardar_retry(url)
-
+        # ── CORRECCIÓN 1: El timeout vuelve al nivel correcto del bucle FOR ──
         if timeout:
             timeouts_totales.append(nombre)
             print(
                 f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
             )
             with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"\nURL: {url}\n")
+                f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n")
                 f.write(
-                    f"\nURL: {url}\nFecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'=' * 60}\n\nTIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n"
-                )
+                    f"{'=' * 60}\n\n"
+                )  # El separador cierra el bloque perfectamente
             if i < len(urls):
                 print(f"\n  {DIM}Esperando {SLEEP_ENTRE_HILOS}s...{RESET}\n")
                 time.sleep(SLEEP_ENTRE_HILOS)
             print()
             continue
 
+        # ── CORRECCIÓN 2: Escritura normal con su separador al final ──
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\nURL: {url}\n")
             f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"{'=' * 60}\n\n")
             if archivos:
                 f.write("\n".join(archivos))
                 f.write("\n\n")
@@ -603,6 +586,7 @@ if __name__ == "__main__":
             else:
                 f.write("Sin errores.")
             f.write("\n")
+            f.write(f"{'=' * 60}\n\n")  # <-- SEPARADOR AGREGADO AQUÍ
 
         mins, segs = duracion // 60, duracion % 60
         tiempo_str = f"{mins}m {segs}s" if mins > 0 else f"{segs}s"
@@ -658,11 +642,10 @@ if __name__ == "__main__":
 
     # Si se procesó lista_retry.txt → backup y borrar
     if os.path.exists(RETRY_FILE):
-        urls_retry_procesadas = [
-            u.strip()
-            for u in open(RETRY_FILE, encoding="utf-8")
-            if u.strip() and not u.startswith("#")
-        ]
+        with open(RETRY_FILE, encoding="utf-8") as f:
+            urls_retry_procesadas = [
+                u.strip() for u in f if u.strip() and not u.startswith("#")
+            ]
         if urls_retry_procesadas and es_retry_run:
             fecha_backup = datetime.now().strftime("%Y-%m-%d %H:%M")
             with open(BACKUP_FILE, "a", encoding="utf-8") as fb:
