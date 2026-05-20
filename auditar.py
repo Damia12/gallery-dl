@@ -35,7 +35,7 @@ WHITE = "\033[37m"
 
 RE_URL = re.compile(r"^URL:\s*(.+)$", re.MULTILINE)
 RE_FECHA = re.compile(r"^Fecha:\s*(.+)$", re.MULTILINE)
-RE_TIMEOUT = re.compile(r"^TIMEOUT", re.MULTILINE)
+RE_TIMEOUT = re.compile(r"^TIMEOUT:", re.MULTILINE)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

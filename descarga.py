@@ -20,15 +20,20 @@ if IS_WINDOWS:
     CONFIG = r"C:\gallery-dl\gallery-dl_win.conf"
     LISTA = r"C:\gallery-dl\lista.txt"
     LOG_DIR = r"G:\Rips\logs"
+    RETRY_FILE = r"C:\gallery-dl\lista_retry.txt"
+    BACKUP_FILE = r"C:\gallery-dl\lista_retry_backup.txt"
 else:
     GALLERY_DL = "gallery-dl"
     CONFIG = os.path.expanduser("~/gallery-dl/gallery-dl_linux.conf")
     LISTA = os.path.expanduser("~/gallery-dl/lista.txt")
     LOG_DIR = os.path.expanduser("~/Rips/logs")
+    RETRY_FILE = os.path.expanduser("~/gallery-dl/lista_retry.txt")
+    BACKUP_FILE = os.path.expanduser("~/gallery-dl/lista_retry_backup.txt")
 
 SLEEP_ENTRE_HILOS = 30
 TIMEOUT_ACTIVIDAD = 300
 TIMEOUT_SIN_ARCHIVOS = 600
+MAX_REINTENTOS = 2
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -163,10 +168,8 @@ def limpiar_error(linea):
     return re.sub(r"^\[gallery-dl\]\s*", "", linea).strip()
 
 
-def descargar_windows(url, reset_archive):
+def descargar_windows(url):
     cmd = [GALLERY_DL, "-c", CONFIG, url]
-    if reset_archive:
-        cmd.append("--no-download-archive")
 
     inicio = time.time()
     archivos_nuevos = []
@@ -272,10 +275,8 @@ def descargar_windows(url, reset_archive):
     )
 
 
-def descargar_linux(url, reset_archive):
+def descargar_linux(url):
     cmd = [GALLERY_DL, "-c", CONFIG, url]
-    if reset_archive:
-        cmd.append("--no-download-archive")
 
     inicio = time.time()
     archivos_nuevos = []
@@ -293,16 +294,18 @@ def descargar_linux(url, reset_archive):
     sys.stdout.write("\033[?25l")
     sys.stdout.flush()
 
-    master_fd, slave_fd = pty.openpty()
-    proceso = subprocess.Popen(
-        cmd, stdout=slave_fd, stderr=slave_fd, close_fds=True, env=env_vars
-    )
-    os.close(slave_fd)
-
+    master_fd = None
+    proceso = None
     buffer = ""
     ultimo_output = time.time()
 
     try:
+        master_fd, slave_fd = pty.openpty()
+        proceso = subprocess.Popen(
+            cmd, stdout=slave_fd, stderr=slave_fd, close_fds=True, env=env_vars
+        )
+        os.close(slave_fd)
+
         while True:
             r, _, _ = select.select([master_fd], [], [], 1.0)
 
@@ -329,7 +332,6 @@ def descargar_linux(url, reset_archive):
                 break
 
             ultimo_output = time.time()
-
             buffer += chunk
             buffer = buffer.replace("\r\n", "\n")
 
@@ -417,16 +419,18 @@ def descargar_linux(url, reset_archive):
 
                     sys.stdout.flush()
     finally:
-        proceso.wait()
-        clear_line()
+        if proceso is not None:
+            proceso.wait()
 
+        clear_line()
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
 
-        try:
-            os.close(master_fd)
-        except OSError:
-            pass
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
 
     return (
         archivos_nuevos,
@@ -438,29 +442,99 @@ def descargar_linux(url, reset_archive):
     )
 
 
+def esperar_entre_hilos(i, total):
+    """Pausa entre hilos y entre reintentos. Imprime el aviso solo si hay más trabajo."""
+    if i < total:
+        print(f"\n  {DIM}Esperando {SLEEP_ENTRE_HILOS}s...{RESET}\n")
+        time.sleep(SLEEP_ENTRE_HILOS)
+    print()
+
+
+def ejecutar_descarga(url, intento=1):
+    """Despacha la descarga a la implementación correcta según plataforma."""
+    if "timeout" in url.lower():
+        time.sleep(15)
+    if intento > 1:
+        print(f"  {YELLOW}↺ Reintento {intento - 1}/{MAX_REINTENTOS}{RESET}\n")
+
+    if IS_WINDOWS:
+        return descargar_windows(url)
+    else:
+        return descargar_linux(url)
+
+
+def elegir_lista():
+    """Pregunta interactivamente qué lista usar si no se pasaron argumentos."""
+    tiene_retry = False
+    retry_count = 0
+    if os.path.exists(RETRY_FILE):
+        with open(RETRY_FILE, encoding="utf-8") as f:
+            lineas_retry = [l.strip() for l in f if l.strip() and not l.startswith("#")]  # noqa: E741
+        tiene_retry = bool(lineas_retry)
+        retry_count = len(lineas_retry)
+
+    print(f"  {CYAN}[1]{RESET} lista.txt          {GRAY}(descarga normal){RESET}")
+
+    if tiene_retry:
+        print(
+            f"  {YELLOW}[2]{RESET} lista_retry.txt    {GRAY}({retry_count} URLs pendientes){RESET}"
+        )
+    else:
+        print(f"  {DIM}[2] lista_retry.txt  (vacía o inexistente){RESET}")
+
+    print()
+
+    while True:
+        try:
+            opcion = input(f"  Opción {CYAN}[1/2]{RESET}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        if opcion == "1":
+            return LISTA
+        elif opcion == "2":
+            if not tiene_retry:
+                print(f"  {RED}lista_retry.txt está vacía o no existe.{RESET}")
+                continue
+            return RETRY_FILE
+        else:
+            print(f"  {YELLOW}Ingresá 1 o 2.{RESET}")
+
+
 if __name__ == "__main__":
-    reset_archive = "--reset" in sys.argv
-    if reset_archive:
-        sys.argv.remove("--reset")
+    es_retry_run = False
 
     if len(sys.argv) > 1:
-        urls = sys.argv[1:]
+        arg = sys.argv[1]
+        if os.path.isfile(arg):
+            if os.path.abspath(arg) == os.path.abspath(RETRY_FILE):
+                es_retry_run = True
+            with open(arg, "r", encoding="utf-8") as f:
+                urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
+        else:
+            urls = sys.argv[1:]
     else:
-        with open(LISTA, "r", encoding="utf-8") as f:
+        print(f"{BOLD}{'═' * 50}{RESET}")
+        print(
+            f"{BOLD}  Iniciando descarga ({'Windows' if IS_WINDOWS else 'Linux/WSL'}) — seleccioná lista{RESET}"
+        )
+        print(f"{BOLD}{'═' * 50}{RESET}\n")
+        archivo = elegir_lista()
+        if archivo == RETRY_FILE:
+            es_retry_run = True
+        with open(archivo, "r", encoding="utf-8") as f:
             urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
 
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
         f"{BOLD}  Iniciando descarga — {len(urls)} hilos ({'Windows' if IS_WINDOWS else 'Linux/WSL'}){RESET}"
     )
-    if reset_archive:
-        print(f"  {YELLOW}Modo: ignorando archive{RESET}")
     print(f"  {GRAY}{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
     print(f"{BOLD}{'═' * 50}{RESET}\n")
 
     errores_totales = []
     timeouts_totales = []
-
     for i, url in enumerate(urls, 1):
         nombre = url.rstrip("/").split("/")[-1][:60]
         log_file = os.path.join(LOG_DIR, f"{nombre}.log")
@@ -468,14 +542,9 @@ if __name__ == "__main__":
         print(f"{BOLD}[{i}/{len(urls)}]{RESET} {CYAN}{nombre}{RESET}")
         print(f"  {GRAY}{url}{RESET}\n")
 
-        if IS_WINDOWS:
-            archivos, errs, nuevos, done, timeout, duracion = descargar_windows(
-                url, reset_archive
-            )
-        else:
-            archivos, errs, nuevos, done, timeout, duracion = descargar_linux(
-                url, reset_archive
-            )
+        archivos, errs, nuevos, done, timeout, duracion = ejecutar_descarga(
+            url, intento=1
+        )
 
         if timeout:
             timeouts_totales.append(nombre)
@@ -483,19 +552,55 @@ if __name__ == "__main__":
                 f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
             )
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write(
-                    f"\nURL: {url}\nFecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'=' * 60}\n\nTIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n"
-                )
-            if i < len(urls):
-                print(f"\n  {DIM}Esperando {SLEEP_ENTRE_HILOS}s...{RESET}\n")
+                f.write(f"\nURL: {url}\n")
+                f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n")
+                f.write(f"{'=' * 60}\n\n")
+            esperar_entre_hilos(i, len(urls))
+            continue
+
+        if errs and es_retry_run:
+            errs_acumulados = list(errs)
+            for reintento in range(1, MAX_REINTENTOS + 1):
+                print(f"\n  {YELLOW}⚠ {len(errs_acumulados)} errores detectados{RESET}")
                 time.sleep(SLEEP_ENTRE_HILOS)
-            print()
+                archivos2, errs2, nuevos2, done2, timeout2, duracion2 = (
+                    ejecutar_descarga(url, intento=reintento + 1)
+                )
+
+                archivos += archivos2
+                nuevos += nuevos2
+                done += done2
+                duracion += duracion2
+
+                if timeout2:
+                    timeout = True
+                    break
+
+                errs_acumulados = errs2
+                if not errs2:
+                    break
+
+            errs = errs_acumulados
+
+        if timeout:
+            timeouts_totales.append(nombre)
+            print(
+                f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
+            )
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"\nURL: {url}\n")
+                f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                if errs:
+                    f.write("ERRORES:\n" + "\n".join(errs) + "\n")
+                f.write(f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n")
+                f.write(f"{'=' * 60}\n\n")
+            esperar_entre_hilos(i, len(urls))
             continue
 
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\nURL: {url}\n")
             f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"{'=' * 60}\n\n")
             if archivos:
                 f.write("\n".join(archivos))
                 f.write("\n\n")
@@ -504,10 +609,10 @@ if __name__ == "__main__":
             else:
                 f.write("Sin errores.")
             f.write("\n")
+            f.write(f"{'=' * 60}\n\n")
 
         mins, segs = duracion // 60, duracion % 60
         tiempo_str = f"{mins}m {segs}s" if mins > 0 else f"{segs}s"
-
         resumen = f"{nuevos} nuevos"
         if done > 0:
             resumen += f" | {done} ya descargados"
@@ -525,10 +630,7 @@ if __name__ == "__main__":
         else:
             print(f"  {GRAY}[✓] {nombre} — sin archivos nuevos{RESET}")
 
-        if i < len(urls):
-            print(f"\n  {DIM}Esperando {SLEEP_ENTRE_HILOS}s...{RESET}\n")
-            time.sleep(SLEEP_ENTRE_HILOS)
-        print()
+        esperar_entre_hilos(i, len(urls))
 
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
@@ -544,7 +646,37 @@ if __name__ == "__main__":
             print(f"    {n}")
     if not errores_totales and not timeouts_totales:
         print(f"  {GREEN}Todos los hilos sin errores.{RESET}")
+    else:
+        retry_pendientes = 0
+        if os.path.exists(RETRY_FILE):
+            with open(RETRY_FILE, "r", encoding="utf-8") as f:
+                retry_pendientes = sum(
+                    1
+                    for l in f  # noqa: E741
+                    if l.strip() and not l.startswith("#")  # noqa: E741
+                )
+        if retry_pendientes:
+            print(
+                f"\n  {YELLOW}→ {retry_pendientes} URLs en lista_retry.txt — corré auditar.py para analizarlas{RESET}"
+            )
     print(f"{BOLD}{'═' * 50}{RESET}")
+
+    if os.path.exists(RETRY_FILE):
+        with open(RETRY_FILE, encoding="utf-8") as f:
+            urls_retry_procesadas = [
+                u.strip() for u in f if u.strip() and not u.startswith("#")
+            ]
+        if urls_retry_procesadas and es_retry_run:
+            fecha_backup = datetime.now().strftime("%Y-%m-%d %H:%M")
+            with open(BACKUP_FILE, "a", encoding="utf-8") as fb:
+                fb.write(f"# {fecha_backup}\n")
+                for u in urls_retry_procesadas:
+                    fb.write(u + "\n")
+                fb.write("\n")
+            os.remove(RETRY_FILE)
+            print(
+                f"  {DIM}lista_retry.txt procesada y vaciada — backup en lista_retry_backup.txt{RESET}"
+            )
 
     if IS_WINDOWS:
         input("\nPresiona Enter para cerrar...")
