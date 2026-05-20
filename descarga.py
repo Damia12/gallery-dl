@@ -473,20 +473,19 @@ def elegir_lista():
         tiene_retry = bool(lineas_retry)
         retry_count = len(lineas_retry)
 
-    print(f"  {CYAN}[1]{RESET} lista.txt          {GRAY}(descarga normal){RESET}")
+    print(f"  {GREEN}[1]{RESET} lista.txt          {GRAY}(descarga normal){RESET}")
 
     if tiene_retry:
         print(
-            f"  {YELLOW}[2]{RESET} lista_retry.txt    {GRAY}({retry_count} URLs pendientes){RESET}"
+            f"  {MAGENTA}[2]{RESET} lista_retry.txt    {GRAY}({retry_count} URLs pendientes){RESET}"
         )
     else:
         print(f"  {DIM}[2] lista_retry.txt  (vacía o inexistente){RESET}")
 
     print()
-
     while True:
         try:
-            opcion = input(f"  Opción {CYAN}[1/2]{RESET}: ").strip()
+            opcion = input(f"  Opción {WHITE}[1/2]{RESET}: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             sys.exit(0)
