@@ -38,6 +38,7 @@ FATAL_KEYWORDS = ["404 not found", "thread deleted", "410 gone", "invalid thread
 TRANSITORY_KEYWORDS = [
     "timeout",
     "502 bad gateway",
+    "503 service unavailable",
     "504 gateway timeout",
     "429 too many requests",
     "connection reset",
@@ -91,14 +92,42 @@ def archivar_log_en_zip(ruta_log):
         print(f"  {RED}[X] Error archivando {os.path.basename(ruta_log)}: {e}{RESET}")
 
 
+def purgar_zip_antiguos(dias_retencion=60):
+    """Busca y elimina archivos ZIP de logs que superen los días de retención establecidos."""
+    import time
+
+    if not os.path.exists(LOG_DIR):
+        return
+
+    ahora = time.time()
+    limite_segundos = dias_retencion * 86400
+    conteo_purgados = 0
+
+    for archivo in os.listdir(LOG_DIR):
+        if archivo.startswith("logs_") and archivo.endswith(".zip"):
+            ruta_zip = os.path.join(LOG_DIR, archivo)
+            try:
+                tiempo_modificacion = os.path.getmtime(ruta_zip)
+                if (ahora - tiempo_modificacion) > limite_segundos:
+                    os.remove(ruta_zip)
+                    conteo_purgados += 1
+            except Exception as e:
+                print(
+                    f"  {YELLOW}[!] No se pudo purgar el archivo {archivo}: {e}{RESET}"
+                )
+
+    if conteo_purgados > 0:
+        print(
+            f"  {GRAY}└── [MANTENIMIENTO] Se eliminaron {conteo_purgados} archivos ZIP antiguos (+{dias_retencion} días).{RESET}"
+        )
+
+
 def buscar_part_huerfanos():
-    """Escanea recursivamente G:\\Rips buscando archivos temporales abandonados por timeouts."""
     part_detectados = []
     if not os.path.exists(RIPS_DIR):
         return part_detectados
 
     for raiz, _, archivos in os.walk(RIPS_DIR):
-        # Omitimos la carpeta de logs para acelerar el escaneo de imágenes/videos
         if "logs" in raiz.lower():
             continue
         for archivo in archivos:
@@ -112,7 +141,8 @@ def analizar_logs():
         print(f"\n  {RED}[X] Error: La ruta de logs '{LOG_DIR}' no existe.{RESET}\n")
         return
 
-    urls_retry = set()
+    # Mapeo estructurado de reintentos: { URL: (Post_ID, Nombre_Carpeta) }
+    diccionario_retry = {}
     mapeo_reporte_retry = {}
     conteo_fatales = 0
     conteo_transitorios = 0
@@ -120,7 +150,6 @@ def analizar_logs():
         f for f in os.listdir(LOG_DIR) if f.endswith(".log") and f != "procesados.log"
     ]
 
-    # 1. Detección de archivos temporales huérfanos en disco
     archivos_part_huerfanos = buscar_part_huerfanos()
 
     if not logs_a_procesar and not archivos_part_huerfanos:
@@ -129,9 +158,10 @@ def analizar_logs():
         )
         return
 
-    # 2. Escaneo forense de los archivos .log
     for archivo in logs_a_procesar:
         ruta_completa = os.path.join(LOG_DIR, archivo)
+        # El nombre del archivo log define el nombre exacto de la carpeta destino
+        nombre_carpeta = os.path.splitext(archivo)[0]
 
         try:
             with open(ruta_completa, "r", encoding="utf-8", errors="replace") as f:
@@ -152,7 +182,8 @@ def analizar_logs():
                             registrar_en_csv(id_llave, url, "FATAL", linea)
                         else:
                             conteo_transitorios += 1
-                            urls_retry.add(url)
+                            # Guardamos la URL amarrada a sus metadatos de origen
+                            diccionario_retry[url] = (id_llave, nombre_carpeta)
                             mapeo_reporte_retry[id_llave] = (
                                 mapeo_reporte_retry.get(id_llave, 0) + 1
                             )
@@ -164,16 +195,21 @@ def analizar_logs():
 
         archivar_log_en_zip(ruta_completa)
 
-    # 3. Escritura depurada de la lista de reintentos
-    if urls_retry:
+    # Escritura Enriquecida con Bloques de Control Meta
+    if diccionario_retry:
         os.makedirs(os.path.dirname(RETRY_FILE), exist_ok=True)
         with open(RETRY_FILE, "w", encoding="utf-8") as f_out:
-            f_out.write("# Lista de reintentos depurada de errores fatales\n")
-            for url in sorted(urls_retry):
+            f_out.write(
+                "# Lista de reintentos enriquecida con metadatos contextuales\n"
+            )
+            for url, (p_id, folder) in sorted(diccionario_retry.items()):
+                f_out.write(f"#META: id={p_id} | folder={folder}\n")
                 f_out.write(f"{url}\n")
     else:
         if os.path.exists(RETRY_FILE):
             os.remove(RETRY_FILE)
+
+    purgar_zip_antiguos(dias_retencion=60)
 
     imprimir_reporte(
         len(logs_a_procesar),
@@ -190,7 +226,7 @@ def imprimir_reporte(total_logs, fatales, transitorios, mapeo_reporte_retry, hue
     print(f"{GRAY}  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
     print(f"{BOLD}{'═' * 55}{RESET}\n")
 
-    print(f"  Bitácoras .log procesadas y comprimidas: {BOLD}{total_logs}{RESET}")
+    print(f"  Archivos .log procesados y comprimidos: {BOLD}{total_logs}{RESET}")
     print(
         f"  Errores Permanentes (FATALES) purgados : {BOLD}{RED}{fatales}{RESET} {GRAY}(guardados en CSV){RESET}"
     )
@@ -198,7 +234,6 @@ def imprimir_reporte(total_logs, fatales, transitorios, mapeo_reporte_retry, hue
         f"  Errores Transitorios aislados para retry: {BOLD}{GREEN}{transitorios}{RESET}"
     )
 
-    # Renderizado estricto del core de archivos huérfanos truncados por el Watchdog
     if huerfanos:
         print(
             f"  Archivos .part huérfanos por Timeout   : {BOLD}{YELLOW}{len(huerfanos)}{RESET}"

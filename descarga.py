@@ -181,8 +181,11 @@ def watchdog_thread(proceso, estado, timeout):
         time.sleep(5)
 
 
-def descargar_windows(url, nombre_modelo):
-    cmd = [GALLERY_DL, "-c", CONFIG, url]
+def descargar_windows(url, nombre_modelo, extra_flags=None):
+    cmd = [GALLERY_DL, "-c", CONFIG]
+    if extra_flags:
+        cmd.extend(extra_flags)
+    cmd.append(url)
     inicio = time.time()
     archivos_nuevos = []
     errores_hilo = []
@@ -285,8 +288,11 @@ def descargar_windows(url, nombre_modelo):
     )
 
 
-def descargar_linux(url, nombre_modelo):
-    cmd = [GALLERY_DL, "-c", CONFIG, url]
+def descargar_linux(url, nombre_modelo, extra_flags=None):
+    cmd = [GALLERY_DL, "-c", CONFIG]
+    if extra_flags:
+        cmd.extend(extra_flags)
+    cmd.append(url)
     inicio = time.time()
     archivos_nuevos = []
     errores_hilo = []
@@ -351,13 +357,13 @@ def descargar_linux(url, nombre_modelo):
                 if idx_n == -1 and idx_r == -1:
                     break
 
-                es_linea_completa = False
+                es_linea_complete = False
                 linea = ""
 
                 if idx_n != -1 and (idx_r == -1 or idx_n < idx_r):
                     linea = buffer[:idx_n]
                     buffer = buffer[idx_n + 1 :]
-                    es_linea_completa = True
+                    es_linea_complete = True
 
                 elif idx_r != -1:
                     texto_antes_del_r = buffer[:idx_r]
@@ -367,7 +373,7 @@ def descargar_linux(url, nombre_modelo):
                     ):
                         linea = texto_antes_del_r
                         buffer = buffer[idx_r + 1 :]
-                        es_linea_completa = True
+                        es_linea_complete = True
                     else:
                         if idx_r == len(buffer) - 1:
                             break
@@ -378,7 +384,7 @@ def descargar_linux(url, nombre_modelo):
                             render_progress_linux(prog_pura)
                         continue
 
-                if es_linea_completa:
+                if es_linea_complete:
                     linea_limpia = linea.strip()
                     if not linea_limpia:
                         continue
@@ -450,19 +456,19 @@ def esperar_entre_hilos(i, total):
     print()
 
 
-def ejecutar_descarga(url, nombre_modelo, intento=1):
+def ejecutar_descarga(url, nombre_modelo, intento=1, extra_flags=None):
     if intento > 1:
         print(f"  {YELLOW}↺ Reintento {intento - 1}/{MAX_REINTENTOS}{RESET}\n")
     if IS_WINDOWS:
-        return descargar_windows(url, nombre_modelo)
+        return descargar_windows(url, nombre_modelo, extra_flags)
     else:
-        return descargar_linux(url, nombre_modelo)
+        return descargar_linux(url, nombre_modelo, extra_flags)
 
 
 def procesar_descargas(urls, es_retry_run=False):
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
-        f"{BOLD}  Iniciando descarga — {len(urls)} hilos ({'Windows' if IS_WINDOWS else 'Linux/WSL'}){RESET}"
+        f"  Iniciando descarga — {len(urls)} hilos ({'Windows' if IS_WINDOWS else 'Linux/WSL'}){RESET}"
     )
     print(f"  {GRAY}{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
     print(f"{BOLD}{'═' * 50}{RESET}\n")
@@ -470,16 +476,28 @@ def procesar_descargas(urls, es_retry_run=False):
     errores_totales = []
     timeouts_totales = []
 
-    for i, url in enumerate(urls, 1):
+    for i, item in enumerate(urls, 1):
+        if isinstance(item, dict):
+            url = item["url"]
+            extra_flags = item["extra_flags"]
+            plan_msg = item["plan_msg"]
+        else:
+            url = item
+            extra_flags = None
+            plan_msg = None
+
         nombre = url.rstrip("/").split("/")[-1][:60]
         nombre_modelo = formatear_nombre_modelo(nombre)
         log_file = os.path.join(LOG_DIR, f"{nombre}.log")
 
         print(f"{BOLD}[{i}/{len(urls)}]{RESET} {CYAN}{nombre}{RESET}")
-        print(f"  {GRAY}{url}{RESET}\n")
+        print(f"  {GRAY}{url}{RESET}")
+        if plan_msg:
+            print(plan_msg)
+        print()
 
         archivos, errs, nuevos, done, timeout, duracion = ejecutar_descarga(
-            url=url, nombre_modelo=nombre_modelo, intento=1
+            url=url, nombre_modelo=nombre_modelo, intento=1, extra_flags=extra_flags
         )
 
         if timeout:
@@ -504,7 +522,10 @@ def procesar_descargas(urls, es_retry_run=False):
                 time.sleep(SLEEP_ENTRE_HILOS)
                 archivos2, errs2, nuevos2, done2, timeout2, duracion2 = (
                     ejecutar_descarga(
-                        url=url, nombre_modelo=nombre_modelo, intento=reintento + 1
+                        url=url,
+                        nombre_modelo=nombre_modelo,
+                        intento=reintento + 1,
+                        extra_flags=extra_flags,
                     )
                 )
                 archivos += archivos2
@@ -573,7 +594,7 @@ def procesar_descargas(urls, es_retry_run=False):
     # Resumen final
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
-        f"{BOLD}  Descarga terminada — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}"
+        f"  Descarga terminada — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}"
     )
     if errores_totales:
         print(f"\n  {YELLOW}Hilos con errores:{RESET}")
@@ -587,9 +608,8 @@ def procesar_descargas(urls, es_retry_run=False):
         print(f"  {GREEN}Todos los hilos sin errores.{RESET}")
     print(f"{BOLD}{'═' * 50}{RESET}\n")
 
-    # PASO 5: Consolidación y Limpieza automática del retry
     if os.path.exists(RETRY_FILE):
-        with open(RETRY_FILE, encoding="utf-8") as f:
+        with open(RETRY_FILE, "r", encoding="utf-8") as f:
             urls_retry_procesadas = [
                 u.strip() for u in f if u.strip() and not u.startswith("#")
             ]
@@ -610,15 +630,15 @@ def elegir_lista():
     tiene_retry = False
     retry_count = 0
     if os.path.exists(RETRY_FILE):
-        with open(RETRY_FILE, encoding="utf-8") as f:
-            lineas_retry = [l.strip() for l in f if l.strip() and not l.startswith("#")]  # noqa: E741
+        with open(RETRY_FILE, "r", encoding="utf-8") as f:
+            lineas_retry = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         tiene_retry = bool(lineas_retry)
         retry_count = len(lineas_retry)
 
     os.system("cls" if os.name == "nt" else "clear")
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
-        f"{BOLD}  {'Windows' if IS_WINDOWS else 'Linux/WSL'} — seleccioná una opción{RESET}"
+        f"  {'Windows' if IS_WINDOWS else 'Linux/WSL'} — seleccioná una opción{RESET}"
     )
     print(f"{BOLD}{'═' * 50}{RESET}\n")
     print(f"  {GREEN}[1]{RESET} lista.txt          {GRAY}(descarga normal){RESET}")
@@ -670,7 +690,6 @@ if __name__ == "__main__":
 
         elif accion == "AUDITAR":
             print(f"\n  {CYAN}Ejecutando auditar.py en subproceso aislado...{RESET}\n")
-            # El búnker del subproceso: protege tu menú si la auditoría falla
             subprocess.run([sys.executable, "auditar.py"])
             print()
             if IS_WINDOWS:
@@ -679,11 +698,68 @@ if __name__ == "__main__":
 
         elif accion == "DESCARGA":
             es_retry_run = payload == RETRY_FILE
-            with open(payload, "r", encoding="utf-8") as f:
-                urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
+            urls = []
+
+            if es_retry_run:
+                meta_actual = None
+                try:
+                    with open(payload, "r", encoding="utf-8") as f:
+                        for linea in f:
+                            linea = linea.strip()
+                            if not linea:
+                                continue
+
+                            if linea.startswith("#META:"):
+                                match_meta = re.search(
+                                    r"id=(\S+)\s*\|\s*folder=(.+)", linea
+                                )
+                                if match_meta:
+                                    meta_actual = {
+                                        "id": match_meta.group(1),
+                                        "folder": match_meta.group(2).strip(),
+                                    }
+                                continue
+
+                            if linea.startswith("http"):
+                                extra_flags = None
+                                plan_msg = f"  {YELLOW}[Plan B] -> Enlace plano o META ausente. Ruta por defecto.{RESET}"
+
+                                if meta_actual and meta_actual["id"] != "Desconocido":
+                                    ruta_destino = os.path.join(
+                                        r"G:\Rips\Simpcity", meta_actual["folder"]
+                                    )
+                                    prefijo_nombre = f"{meta_actual['id']}_{{filename}}.{{extension}}"
+                                    extra_flags = [
+                                        "-o",
+                                        f"directory={ruta_destino}",
+                                        "-o",
+                                        f"filename={prefijo_nombre}",
+                                    ]
+                                    plan_msg = f"  {GREEN}[Plan A] -> Post ID: {meta_actual['id']} | Carpeta: {meta_actual['folder']}{RESET}"
+
+                                urls.append(
+                                    {
+                                        "url": linea,
+                                        "extra_flags": extra_flags,
+                                        "plan_msg": plan_msg,
+                                    }
+                                )
+                                meta_actual = None
+                except Exception as e:
+                    print(
+                        f"\n  {RED}[X] Error crítico leyendo archivo de reintentos: {e}{RESET}\n"
+                    )
+                    if IS_WINDOWS:
+                        input(f"  {GRAY}Presioná Enter para volver al menú...{RESET}")
+                    continue
+            else:
+                with open(payload, "r", encoding="utf-8") as f:
+                    urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
 
             if not urls:
-                print(f"\n  {YELLOW}El archivo está vacío.{RESET}\n")
+                print(
+                    f"\n  {YELLOW}El archivo está vacío o no contiene URLs válidas.{RESET}\n"
+                )
                 if IS_WINDOWS:
                     input(f"  {GRAY}Presioná Enter para volver al menú...{RESET}")
                 continue
