@@ -1,393 +1,265 @@
 #!/usr/bin/env python3
-r"""
-auditar.py — Analiza logs de descarga, detecta .part huérfanos, genera lista_retry.txt
-aplicando discriminación de errores y extrayendo la URL específica del fallo.
-
-Uso: python auditar.py [--rips-dir G:/Rips]
-"""
-
 import csv
 import os
 import re
 import sys
 import zipfile
 from datetime import datetime
-from pathlib import Path
 
-IS_WINDOWS = sys.platform == "win32"
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
 
-if IS_WINDOWS:
-    LOG_DIR = r"G:\Rips\logs"
-    RIPS_DIR = r"G:\Rips"
-    RETRY_FILE = r"C:\gallery-dl\lista_retry.txt"
-    LISTA = r"C:\gallery-dl\lista.txt"
-else:
-    LOG_DIR = os.path.expanduser("~/Rips/logs")
-    RIPS_DIR = os.path.expanduser("~/Rips")
-    RETRY_FILE = os.path.expanduser("~/gallery-dl/lista_retry.txt")
-    LISTA = os.path.expanduser("~/gallery-dl/lista.txt")
+# ==========================================
+# CONFIGURACIÓN DE RUTAS FIJAS (WINDOWS)
+# ==========================================
+RIPS_DIR = r"G:\Rips"
+LOG_DIR = r"G:\Rips\logs"
+RETRY_FILE = r"C:\gallery-dl\lista_retry.txt"
+HISTORIAL_CSV = r"C:\gallery-dl\historial_fallos.csv"
+ZIP_FILE = os.path.join(LOG_DIR, f"logs_{datetime.now().strftime('%Y-%m-%d')}.zip")
 
-# Archivo acumulativo de auditoría
-CSV_HISTORIAL = os.path.join(LOG_DIR, "historial_fallos.csv")
-
+# Paletas de Color ANSI para Reporte Forense
 RESET = "\033[0m"
 BOLD = "\033[1m"
-DIM = "\033[2m"
-CYAN = "\033[36m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
 GRAY = "\033[90m"
 RED = "\033[31m"
-WHITE = "\033[37m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+MAGENTA = "\033[35m"
 
-RE_FECHA = re.compile(r"^Fecha:\s*(.+)$", re.MULTILINE)
-RE_URL = re.compile(r"^URL:\s*(.+)$", re.MULTILINE)
-RE_TIMEOUT = re.compile(r"^TIMEOUT:", re.MULTILINE)
+# Expresiones regulares quirúrgicas
+RE_LOG_ENRIQUECIDO = re.compile(
+    r"(?:\[Post:\s*(\d+)\])?.*?(?:for|download)\s+'?(https?://[^\s']+)'?", re.IGNORECASE
+)
 
-# Regex para extraer URLs específicas dentro del texto del error (ej. for 'https://...')
-RE_EXTRAER_URL = re.compile(r"for\s+'([^']+)'")
-
-ERRORES_FATALES = ["404 not found", "unsupported url", "thread deleted", "410 gone"]
-ERRORES_TRANSITORIOS = [
+# Diccionarios de clasificación de firmas de error
+FATAL_KEYWORDS = ["404 not found", "thread deleted", "410 gone", "invalid thread"]
+TRANSITORY_KEYWORDS = [
+    "timeout",
     "502 bad gateway",
-    "504 gateway",
-    "500 internal",
-    "html response",
-    "timed out",
+    "504 gateway timeout",
+    "429 too many requests",
     "connection reset",
 ]
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+KEYWORDS_ERROR = ["error", "warning", "failed", "unsupported", "unable", "exception"]
+KEYWORDS_RUIDO = ["theme-light", "color-", "--rem", "None_"]
 
 
-def leer_lista(path):
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        return [
-            linea.strip() for linea in f if linea.strip() and not linea.startswith("#")
-        ]
+def es_linea_error(linea):
+    linea_lower = linea.lower()
+    return any(k in linea_lower for k in KEYWORDS_ERROR) and not any(
+        x in linea for x in KEYWORDS_RUIDO
+    )
 
 
-def cargar_urls_lista():
-    urls = leer_lista(LISTA)
-    mapa = {}
-    for url in urls:
-        nombre = url.rstrip("/").split("/")[-1][:60]
-        mapa[nombre] = url
-    return mapa
+def clasificar_error(linea):
+    linea_lower = linea.lower()
+    if any(k in linea_lower for k in FATAL_KEYWORDS):
+        return "FATAL"
+    if any(k in linea_lower for k in TRANSITORY_KEYWORDS):
+        return "TRANSITORIO"
+    return "TRANSITORIO"
 
 
-# ── Análisis Forense de Logs ──────────────────────────────────────────────────
+def registrar_en_csv(post_id, url, tipo_error, mensaje):
+    existe = os.path.exists(HISTORIAL_CSV)
+    os.makedirs(os.path.dirname(HISTORIAL_CSV), exist_ok=True)
+
+    with open(HISTORIAL_CSV, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter=";")
+        if not existe:
+            writer.writerow(["Fecha", "Post_ID", "URL", "Tipo_Error", "Detalle_Error"])
+        writer.writerow(
+            [
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                post_id if post_id else "Desconocido",
+                url,
+                tipo_error,
+                mensaje.strip(),
+            ]
+        )
 
 
-def parsear_log(log_path):
-    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-        contenido = f.read()
+def archivar_log_en_zip(ruta_log):
+    try:
+        with zipfile.ZipFile(ZIP_FILE, "a", compression=zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(ruta_log, os.path.basename(ruta_log))
+        os.remove(ruta_log)
+    except Exception as e:
+        print(f"  {RED}[X] Error archivando {os.path.basename(ruta_log)}: {e}{RESET}")
 
-    bloques = re.split(r"={10,}", contenido)
-    sesiones = []
 
-    for bloque in bloques:
-        bloque = bloque.strip()
-        if not bloque:
+def purgar_zip_antiguos(dias_retencion=30):
+    """Busca y elimina archivos ZIP de logs que superen los días de retención establecidos."""
+    import time
+
+    if not os.path.exists(LOG_DIR):
+        return
+
+    ahora = time.time()
+    limite_segundos = dias_retencion * 86400  # 86400 segundos tiene un día
+    conteo_purgados = 0
+
+    for archivo in os.listdir(LOG_DIR):
+        if archivo.startswith("logs_") and archivo.endswith(".zip"):
+            ruta_zip = os.path.join(LOG_DIR, archivo)
+            try:
+                # Obtenemos la última fecha de modificación del archivo
+                tiempo_modificacion = os.path.getmtime(ruta_zip)
+                if (ahora - tiempo_modificacion) > limite_segundos:
+                    os.remove(ruta_zip)
+                    conteo_purgados += 1
+            except Exception as e:
+                print(
+                    f"  {YELLOW}[!] No se pudo purgar el archivo {archivo}: {e}{RESET}"
+                )
+
+    if conteo_purgados > 0:
+        print(
+            f"  {GRAY}└── [MANTENIMIENTO] Se eliminaron {conteo_purgados} archivos ZIP antiguos (+{dias_retencion} días).{RESET}"
+        )
+
+
+def buscar_part_huerfanos():
+    """Escanea recursivamente G:\\Rips buscando archivos temporales abandonados por timeouts."""
+    part_detectados = []
+    if not os.path.exists(RIPS_DIR):
+        return part_detectados
+
+    for raiz, _, archivos in os.walk(RIPS_DIR):
+        # Omitimos la carpeta de logs para acelerar el escaneo de imágenes/videos
+        if "logs" in raiz.lower():
             continue
-
-        url_match = RE_URL.search(bloque)
-        fecha_match = RE_FECHA.search(bloque)
-        timeout = bool(RE_TIMEOUT.search(bloque))
-
-        errores = []
-        en_bloque_errores = False
-        for linea in bloque.splitlines():
-            if linea.strip() == "ERRORES:":
-                en_bloque_errores = True
-                continue
-            if en_bloque_errores:
-                if linea.strip():
-                    errores.append(linea.strip())
-                else:
-                    en_bloque_errores = False
-
-        url = url_match.group(1).strip() if url_match else None
-        fecha = fecha_match.group(1).strip() if fecha_match else None
-
-        if url:
-            sesiones.append(
-                {"url": url, "fecha": fecha, "timeout": timeout, "errores": errores}
-            )
-
-    return sesiones
+        for archivo in archivos:
+            if archivo.endswith(".part"):
+                part_detectados.append(os.path.join(raiz, archivo))
+    return part_detectados
 
 
 def analizar_logs():
     if not os.path.exists(LOG_DIR):
-        print(f"  {RED}No se encontró el directorio de logs: {LOG_DIR}{RESET}")
-        return {}
+        print(f"\n  {RED}[X] Error: La ruta de logs '{LOG_DIR}' no existe.{RESET}\n")
+        return
 
-    logs = sorted(Path(LOG_DIR).glob("*.log"))
-    if not logs:
-        print(f"  {GRAY}No hay archivos .log en {LOG_DIR}{RESET}")
-        return {}
+    urls_retry = set()
+    mapeo_reporte_retry = {}
+    conteo_fatales = 0
+    conteo_transitorios = 0
+    logs_a_procesar = [
+        f for f in os.listdir(LOG_DIR) if f.endswith(".log") and f != "procesados.log"
+    ]
 
-    resultados = {}
-    for log_path in logs:
-        nombre = log_path.stem
+    # 1. Detección de archivos temporales huérfanos en disco
+    archivos_part_huerfanos = buscar_part_huerfanos()
+
+    if not logs_a_procesar and not archivos_part_huerfanos:
+        print(
+            f"\n  {GREEN}[✓] Ecosistema limpio. Sin logs nuevos ni archivos .part huérfanos.{RESET}\n"
+        )
+        return
+
+    # 2. Escaneo forense de los archivos .log
+    for archivo in logs_a_procesar:
+        ruta_completa = os.path.join(LOG_DIR, archivo)
+
         try:
-            sesiones = parsear_log(log_path)
+            with open(ruta_completa, "r", encoding="utf-8", errors="replace") as f:
+                for linea in f:
+                    if not es_linea_error(linea):
+                        continue
+
+                    match = RE_LOG_ENRIQUECIDO.search(linea)
+                    if match:
+                        post_id = match.group(1)
+                        url = match.group(2).strip()
+                        tipo = clasificar_error(linea)
+
+                        id_llave = post_id if post_id else "Desconocido"
+
+                        if tipo == "FATAL":
+                            conteo_fatales += 1
+                            registrar_en_csv(id_llave, url, "FATAL", linea)
+                        else:
+                            conteo_transitorios += 1
+                            urls_retry.add(url)
+                            mapeo_reporte_retry[id_llave] = (
+                                mapeo_reporte_retry.get(id_llave, 0) + 1
+                            )
+                            registrar_en_csv(id_llave, url, "TRANSITORIO", linea)
+
         except Exception as e:
-            print(f"  {YELLOW}[!] Error leyendo {log_path.name}: {e}{RESET}")
+            print(f"  {YELLOW}[!] Advertencia leyendo {archivo}: {e}{RESET}")
             continue
 
-        if sesiones:
-            resultados[nombre] = sesiones[-1]
+        archivar_log_en_zip(ruta_completa)
 
-    return resultados
-
-
-# ── Detección de .part Huérfanos ──────────────────────────────────────────────
-
-
-def buscar_parts(rips_dir):
-    parts = []
-    for root, _, files in os.walk(rips_dir):
-        for fname in files:
-            if fname.endswith(".part"):
-                ruta = os.path.join(root, fname)
-                tam = os.path.getsize(ruta)
-                parts.append({"ruta": ruta, "nombre": fname, "tam": tam})
-    return parts
-
-
-def mapear_parts_a_urls(parts, mapa_urls):
-    mapeados = []
-    sin_mapear = []
-
-    for p in parts:
-        partes_ruta = Path(p["ruta"]).parts
-        url_encontrada = None
-        for segmento in partes_ruta:
-            segmento_clean = segmento[:60]
-            if segmento_clean in mapa_urls:
-                url_encontrada = mapa_urls[segmento_clean]
-                break
-
-        if url_encontrada:
-            mapeados.append({**p, "url": url_encontrada})
-        else:
-            sin_mapear.append(p)
-
-    return mapeados, sin_mapear
-
-
-# ── Reporte Visual ───────────────────────────────────────────────────────────
-
-
-def imprimir_reporte(
-    con_errores,
-    con_timeout,
-    sin_problemas,
-    parts_mapeados,
-    parts_sin_mapear,
-    total_logs,
-):
-    ancho = 56
-    print(f"\n{BOLD}{'═' * ancho}{RESET}")
-    print(
-        f"{BOLD}  REPORTE DE AUDITORÍA — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}"
-    )
-    print(f"{BOLD}{'═' * ancho}{RESET}\n")
-
-    print(f"{BOLD}  LOGS ANALIZADOS: {total_logs}{RESET}")
-    print(f"  {GREEN}[+] Sin problemas:        {len(sin_problemas)}{RESET}")
-    print(
-        f"  {YELLOW}[!] Errores Recuperables: {len([h for h in con_errores if h[2]])}{RESET}"
-    )
-    print(
-        f"  {RED}[X] Errores Fatales:      {len([h for h in con_errores if not h[2]])}{RESET}"
-    )
-    print(f"  {RED}[TIMEOUT] Con Timeout:          {len(con_timeout)}{RESET}")
-
-    if con_errores:
-        print(f"\n{BOLD}  DIAGNÓSTICO FORENSE DE ERRORES:{RESET}")
-        for nombre, sesion, es_recuperable, diagnostico in con_errores:
-            color = YELLOW if es_recuperable else RED
-            marca = "[RETRY]" if es_recuperable else "[X] [FATAL - DESCARTADO]"
-            print(f"\n  {color}-> {nombre} — {marca}{RESET}")
-            print(f"    {GRAY}Diagnóstico: {diagnostico}{RESET}")
-            print(f"    {GRAY}URL Hilo:    {sesion['url']}{RESET}")
-            for err in sesion["errores"][:3]:
-                print(f"    {RED}· {err}{RESET}")
-
-    if con_timeout:
-        print(f"\n{BOLD}  HILOS CON TIMEOUT (SIEMPRE RECUPERABLES):{RESET}")
-        for nombre, sesion in con_timeout:
-            print(f"  {YELLOW}-> {nombre} — [RETRY] [TIMEOUT]{RESET}")
-            print(f"    {GRAY}{sesion['url']}{RESET}")
-
-    print(f"\n{BOLD}{'─' * ancho}{RESET}")
-    print(
-        f"{BOLD}  ARCHIVOS .PART HUÉRFANOS: {len(parts_mapeados) + len(parts_sin_mapear)}{RESET}"
-    )
-
-    if parts_mapeados:
-        print(f"\n  {YELLOW}Mapeados a URL conocida ({len(parts_mapeados)}):{RESET}")
-        for p in parts_mapeados:
-            tam_str = (
-                f"{p['tam'] / 1024 / 1024:.1f} MB"
-                if p["tam"] > 1024 * 1024
-                else f"{p['tam'] / 1024:.1f} KB"
-            )
-            print(f"  {YELLOW}-> {p['nombre']}{RESET} {GRAY}({tam_str}){RESET}")
-
-    if not parts_mapeados and not parts_sin_mapear:
-        print(f"  {GREEN}No se encontraron archivos .part{RESET}")
-
-    print(f"\n{BOLD}{'═' * ancho}{RESET}\n")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    rips_dir = RIPS_DIR
-    if "--rips-dir" in sys.argv:
-        idx = sys.argv.index("--rips-dir")
-        if idx + 1 < len(sys.argv):
-            rips_dir = sys.argv[idx + 1]
-
-    print(f"{BOLD}{'═' * 56}{RESET}")
-    print(f"  Auditando logs en: {LOG_DIR}")
-    print(f"  Buscando .part en: {rips_dir}")
-    print(f"{BOLD}{'═' * 56}{RESET}\n")
-
-    resultados_logs = analizar_logs()
-    parts = buscar_parts(rips_dir)
-    mapa_urls = cargar_urls_lista()
-    parts_mapeados, parts_sin_mapear = mapear_parts_a_urls(parts, mapa_urls)
-
-    sin_problemas = []
-    con_timeout = []
-    con_errores = []
-
-    urls_para_retry = []
-    csv_rows_nuevas = []
-    ahora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    for nombre, sesion in resultados_logs.items():
-        if not sesion["errores"] and not sesion["timeout"]:
-            sin_problemas.append((nombre, sesion))
-            continue
-
-        if sesion["timeout"]:
-            con_timeout.append((nombre, sesion))
-            urls_para_retry.append(sesion["url"])
-            csv_rows_nuevas.append(
-                [ahora_str, nombre, "TIMEOUT_ACTIVIDAD", sesion["url"], "N/A"]
-            )
-            continue
-
-        if sesion["errores"]:
-            es_recuperable = True
-            diagnostico = "RECUPERABLE: Error desconocido / No clasificado (Reintento por precaución)"
-
-            # Buscaremos si alguna línea expone una URL específica caída
-            url_problematica = "No especificada en el log"
-
-            for err in sesion["errores"]:
-                err_lower = err.lower()
-
-                # Intentar extraer la URL específica de este error (ej: Bunkr o Gofile directo)
-                match_url = RE_EXTRAER_URL.search(err)
-                if match_url:
-                    url_problematica = match_url.group(1)
-
-                if any(f in err_lower for f in ERRORES_FATALES):
-                    es_recuperable = False
-                    diagnostico = "FATAL: Enlace caído, borrado o URL no soportada (404/Unsupported)"
-                    break  # Prioridad fatal de descarte
-
-                elif any(t in err_lower for t in ERRORES_TRANSITORIOS):
-                    es_recuperable = True
-                    diagnostico = "RECUPERABLE: Sobrecarga transitoria del servidor externo (502/504/HTML-Response)"
-
-            con_errores.append((nombre, sesion, es_recuperable, diagnostico))
-
-            tipo_csv = (
-                f"TRANSITORIO ({diagnostico.split(': ')[0]})"
-                if es_recuperable
-                else f"FATAL ({diagnostico.split(': ')[0]})"
-            )
-            if es_recuperable:
-                urls_para_retry.append(sesion["url"])
-
-            csv_rows_nuevas.append(
-                [ahora_str, nombre, tipo_csv, sesion["url"], url_problematica]
-            )
-
-    for p in parts_mapeados:
-        if p["url"] not in urls_para_retry:
-            urls_para_retry.append(p["url"])
-
-    if urls_para_retry:
-        with open(RETRY_FILE, "w", encoding="utf-8") as f:
-            for url in urls_para_retry:
-                f.write(url + "\n")
+    # 3. Escritura depurada de la lista de reintentos
+    if urls_retry:
+        os.makedirs(os.path.dirname(RETRY_FILE), exist_ok=True)
+        with open(RETRY_FILE, "w", encoding="utf-8") as f_out:
+            f_out.write("# Lista de reintentos depurada de errores fatales\n")
+            for url in sorted(urls_retry):
+                f_out.write(f"{url}\n")
     else:
         if os.path.exists(RETRY_FILE):
             os.remove(RETRY_FILE)
 
-    # Escritura en CSV con la nueva columna 'URL_Problematica'
-    if csv_rows_nuevas:
-        existe_csv = os.path.exists(CSV_HISTORIAL)
-        with open(CSV_HISTORIAL, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f, delimiter=";")
-            if not existe_csv:
-                writer.writerow(
-                    [
-                        "Fecha_Registro",
-                        "Hilo",
-                        "Tipo_Fallo",
-                        "URL_Hilo_Simpcity",
-                        "URL_Problematica_Directa",
-                    ]
-                )
-            writer.writerows(csv_rows_nuevas)
+    purgar_zip_antiguos(dias_retencion=60)
 
     imprimir_reporte(
-        con_errores,
-        con_timeout,
-        sin_problemas,
-        parts_mapeados,
-        parts_sin_mapear,
-        len(resultados_logs),
+        len(logs_a_procesar),
+        conteo_fatales,
+        conteo_transitorios,
+        mapeo_reporte_retry,
+        archivos_part_huerfanos,
     )
 
-    if resultados_logs:
-        archivo_dir = os.path.join(LOG_DIR, "archivo")
-        os.makedirs(archivo_dir, exist_ok=True)
 
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        zip_path = os.path.join(archivo_dir, f"sesion_{stamp}.zip")
-        logs_a_empaquetar = [f for f in os.listdir(LOG_DIR) if f.endswith(".log")]
+def imprimir_reporte(total_logs, fatales, transitorios, mapeo_reporte_retry, huerfanos):
+    print(f"{BOLD}{'═' * 55}{RESET}")
+    print(f"{BOLD}{CYAN}  REPORTE INTEGRAL DE AUDITORÍA ANALÍTICA{RESET}")
+    print(f"{GRAY}  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
+    print(f"{BOLD}{'═' * 55}{RESET}\n")
 
-        if logs_a_empaquetar:
-            print(f"  {DIM}Empaquetando logs en {Path(zip_path).name}...{RESET}")
-            try:
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                    for filename in logs_a_empaquetar:
-                        ruta_original = os.path.join(LOG_DIR, filename)
-                        zipf.write(ruta_original, filename)
+    print(f"  Archivos .log procesados y comprimidos: {BOLD}{total_logs}{RESET}")
+    print(
+        f"  Errores Permanentes (FATALES) purgados : {BOLD}{RED}{fatales}{RESET} {GRAY}(guardados en CSV){RESET}"
+    )
+    print(
+        f"  Errores Transitorios aislados para retry: {BOLD}{GREEN}{transitorios}{RESET}"
+    )
 
-                for filename in logs_a_empaquetar:
-                    os.remove(os.path.join(LOG_DIR, filename))
+    # Renderizado estricto del core de archivos huérfanos truncados por el Watchdog
+    if huerfanos:
+        print(
+            f"  Archivos .part huérfanos por Timeout   : {BOLD}{YELLOW}{len(huerfanos)}{RESET}"
+        )
+        for path in huerfanos:
+            print(
+                f"    {RED}└── Corrupto:{RESET} {GRAY}...\\{os.path.basename(os.path.dirname(path))}\\{os.path.basename(path)}{RESET}"
+            )
+        print()
+    else:
+        print(f"  Archivos .part huérfanos por Timeout   : {BOLD}{GREEN}0{RESET}\n")
 
-                print(
-                    f"  {GRAY}Refactor completo: logs comprimidos y carpeta principal despejada con mapeo de URLs. {RESET}\n"
-                )
-            except Exception as e:
-                print(
-                    f"  {RED}[!] Error crítico en la compresión del ZIP: {e}{RESET}\n"
-                )
+    if mapeo_reporte_retry:
+        print(
+            f"{BOLD}{MAGENTA}  Distribución de reintentos por Publicación (Post ID):{RESET}"
+        )
+        for post_id, cuenta in mapeo_reporte_retry.items():
+            color_id = YELLOW if post_id.isdigit() else GRAY
+            print(
+                f"    ├── Post ID: {color_id}{post_id}{RESET} ──> [{BOLD}{GREEN}{cuenta} URL(s) en cola{RESET}]"
+            )
+    else:
+        print(
+            f"  {GREEN}[✓] Carpeta limpia. No hay URLs caídas que requieran reintento.{RESET}"
+        )
 
-    if IS_WINDOWS:
-        input("Presiona Enter para cerrar...")
+    print(f"{BOLD}\n{'═' * 55}{RESET}")
+
+
+if __name__ == "__main__":
+    analizar_logs()

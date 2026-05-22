@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import errno
 import os
 import re
@@ -9,12 +8,19 @@ import threading
 import time
 from datetime import datetime
 
+# Forzar codificación UTF-8 en la terminal para evitar fallos con caracteres raros
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+
 IS_WINDOWS = sys.platform == "win32"
 
 if not IS_WINDOWS:
     import pty
     import select
 
+# ==========================================
+# CONFIGURACIÓN DE RUTAS FIJAS
+# ==========================================
 if IS_WINDOWS:
     GALLERY_DL = "gallery-dl.exe"
     CONFIG = r"C:\gallery-dl\gallery-dl_win.conf"
@@ -37,6 +43,7 @@ MAX_REINTENTOS = 2
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# Estilos y Colores ANSI
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -49,16 +56,17 @@ RED = "\033[31m"
 WHITE = "\033[37m"
 
 ACCENT = WHITE
-
 SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 spinner_idx = 0
 
 ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-
 RE_PROGRESS = re.compile(
     r"(\d+)%\s+([\d.]+)\s*([KkMmGgTt]?[Bb])\s+([\d.]+)\s*([KkMmGgTt]?[Bb]/s)",
     re.IGNORECASE,
 )
+
+KEYWORDS_ERROR = ["error", "warning", "failed", "unsupported", "unable", "exception"]
+KEYWORDS_RUIDO = ["theme-light", "color-", "--rem", "None_"]
 
 
 def clear_line():
@@ -80,14 +88,24 @@ def nombre_visible(ruta):
 
 
 def formatear_nombre_modelo(nombre_hilo):
-    """Transforma 'guro-sato-gurosato.1039671' en 'Guro Sato'."""
-    base = nombre_hilo.split(".")[0]  # Quita el ID numérico
+    base = nombre_hilo.split(".")[0]
     partes = base.split("-")
     vistas = []
     for p in partes:
         if p not in vistas and len(vistas) < 2:
             vistas.append(p.capitalize())
     return " ".join(vistas)
+
+
+def es_linea_error(linea):
+    linea_lower = linea.lower()
+    return any(k in linea_lower for k in KEYWORDS_ERROR) and not any(
+        x in linea for x in KEYWORDS_RUIDO
+    )
+
+
+def limpiar_error(linea):
+    return re.sub(r"^\[gallery-dl\]\s*", "", linea).strip()
 
 
 def render_progress_linux(linea_pura):
@@ -136,7 +154,6 @@ def spinner_thread_windows(estado, lock_print):
             if 0 <= p < ancho_barra:
                 barra_lista[p] = "━"
         barra_interna = "".join(barra_lista)
-
         barra_visual = f"{DIM}│{RESET}{ACCENT}{barra_interna}{RESET}{DIM}│{RESET}"
 
         with lock_print:
@@ -164,24 +181,8 @@ def watchdog_thread(proceso, estado, timeout):
         time.sleep(5)
 
 
-KEYWORDS_ERROR = ["error", "warning", "failed", "unsupported", "unable", "exception"]
-KEYWORDS_RUIDO = ["theme-light", "color-", "--rem", "None_"]
-
-
-def es_linea_error(linea):
-    linea_lower = linea.lower()
-    return any(k in linea_lower for k in KEYWORDS_ERROR) and not any(
-        x in linea for x in KEYWORDS_RUIDO
-    )
-
-
-def limpiar_error(linea):
-    return re.sub(r"^\[gallery-dl\]\s*", "", linea).strip()
-
-
 def descargar_windows(url, nombre_modelo):
     cmd = [GALLERY_DL, "-c", CONFIG, url]
-
     inicio = time.time()
     archivos_nuevos = []
     errores_hilo = []
@@ -267,12 +268,10 @@ def descargar_windows(url, nombre_modelo):
     finally:
         proceso.wait()
         stderr_thread.join(timeout=5)
-
         estado_spinner["stop"] = True
         estado_watchdog["stop"] = True
         spin.join(timeout=2)
         watch.join(timeout=2)
-
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
 
@@ -288,7 +287,6 @@ def descargar_windows(url, nombre_modelo):
 
 def descargar_linux(url, nombre_modelo):
     cmd = [GALLERY_DL, "-c", CONFIG, url]
-
     inicio = time.time()
     archivos_nuevos = []
     errores_hilo = []
@@ -373,7 +371,6 @@ def descargar_linux(url, nombre_modelo):
                     else:
                         if idx_r == len(buffer) - 1:
                             break
-
                         buffer = buffer[idx_r + 1 :]
                         prog_limpio = texto_antes_del_r.strip()
                         if prog_limpio and "%" in prog_limpio:
@@ -395,18 +392,14 @@ def descargar_linux(url, nombre_modelo):
 
                     es_done = "\x1b[2m" in linea_limpia
                     es_error = es_linea_error(linea_limpia)
-
                     linea_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
 
-                    if not linea_pura:
-                        continue
-                    if linea_pura == ultima_ruta:
+                    if not linea_pura or linea_pura == ultima_ruta:
                         continue
                     ultima_ruta = linea_pura
 
                     partes = linea_pura.split(" ", 1)
                     nombre_visible_str = partes[1] if len(partes) > 1 else linea_pura
-
                     contador_seq += 1
 
                     if es_done:
@@ -427,16 +420,13 @@ def descargar_linux(url, nombre_modelo):
                         sys.stdout.write(
                             f"\r\033[2K  {GREEN}[{contador_seq:>3}] {nombre_visible_str}{RESET}\n"
                         )
-
                     sys.stdout.flush()
     finally:
         if proceso is not None:
             proceso.wait()
-
         clear_line()
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
-
         if master_fd is not None:
             try:
                 os.close(master_fd)
@@ -454,7 +444,6 @@ def descargar_linux(url, nombre_modelo):
 
 
 def esperar_entre_hilos(i, total):
-    """Pausa entre hilos y entre reintentos. Imprime el aviso solo si hay más trabajo."""
     if i < total:
         print(f"\n  {DIM}Esperando {SLEEP_ENTRE_HILOS}s...{RESET}\n")
         time.sleep(SLEEP_ENTRE_HILOS)
@@ -462,78 +451,15 @@ def esperar_entre_hilos(i, total):
 
 
 def ejecutar_descarga(url, nombre_modelo, intento=1):
-    """Despacha la descarga a la implementación correcta según plataforma."""
     if intento > 1:
-        print(f"  {YELLOW}[RETRY] {intento - 1}/{MAX_REINTENTOS}{RESET}\n")
-
+        print(f"  {YELLOW}↺ Reintento {intento - 1}/{MAX_REINTENTOS}{RESET}\n")
     if IS_WINDOWS:
         return descargar_windows(url, nombre_modelo)
     else:
         return descargar_linux(url, nombre_modelo)
 
 
-def elegir_lista():
-    """Pregunta interactivamente qué lista usar si no se pasaron argumentos."""
-    tiene_retry = False
-    retry_count = 0
-    if os.path.exists(RETRY_FILE):
-        with open(RETRY_FILE, encoding="utf-8") as f:
-            lineas_retry = [l.strip() for l in f if l.strip() and not l.startswith("#")]  # noqa: E741
-        tiene_retry = bool(lineas_retry)
-        retry_count = len(lineas_retry)
-
-    print(f"  {GREEN}[1]{RESET} lista.txt          {GRAY}(descarga normal){RESET}")
-
-    if tiene_retry:
-        print(
-            f"  {MAGENTA}[2]{RESET} lista_retry.txt    {GRAY}({retry_count} URLs pendientes){RESET}"
-        )
-    else:
-        print(f"  {DIM}[2] lista_retry.txt  (vacía o inexistente){RESET}")
-
-    print()
-    while True:
-        try:
-            opcion = input(f"  Opción {WHITE}[1/2]{RESET}: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            sys.exit(0)
-
-        if opcion == "1":
-            return LISTA
-        elif opcion == "2":
-            if not tiene_retry:
-                print(f"  {RED}lista_retry.txt está vacía o no existe.{RESET}")
-                continue
-            return RETRY_FILE
-        else:
-            print(f"  {YELLOW}Ingresá 1 o 2.{RESET}")
-
-
-if __name__ == "__main__":
-    es_retry_run = False
-
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
-        if os.path.isfile(arg):
-            if os.path.abspath(arg) == os.path.abspath(RETRY_FILE):
-                es_retry_run = True
-            with open(arg, "r", encoding="utf-8") as f:
-                urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
-        else:
-            urls = sys.argv[1:]
-    else:
-        print(f"{BOLD}{'═' * 50}{RESET}")
-        print(
-            f"{BOLD}  Iniciando descarga ({'Windows' if IS_WINDOWS else 'Linux/WSL'}) — seleccioná lista{RESET}"
-        )
-        print(f"{BOLD}{'═' * 50}{RESET}\n")
-        archivo = elegir_lista()
-        if archivo == RETRY_FILE:
-            es_retry_run = True
-        with open(archivo, "r", encoding="utf-8") as f:
-            urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
-
+def procesar_descargas(urls, es_retry_run=False):
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
         f"{BOLD}  Iniciando descarga — {len(urls)} hilos ({'Windows' if IS_WINDOWS else 'Linux/WSL'}){RESET}"
@@ -543,6 +469,7 @@ if __name__ == "__main__":
 
     errores_totales = []
     timeouts_totales = []
+
     for i, url in enumerate(urls, 1):
         nombre = url.rstrip("/").split("/")[-1][:60]
         nombre_modelo = formatear_nombre_modelo(nombre)
@@ -558,22 +485,22 @@ if __name__ == "__main__":
         if timeout:
             timeouts_totales.append(nombre)
             print(
-                f"\n  {RED}[TIMEOUT] Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
+                f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
             )
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"\nURL: {url}\n")
-                f.write(f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n")
-                f.write(f"{'=' * 60}\n\n")
+                f.write(
+                    f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nURL: {url}\n"
+                )
+                f.write(
+                    f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n{'=' * 60}\n\n"
+                )
             esperar_entre_hilos(i, len(urls))
             continue
 
         if errs and es_retry_run:
             errs_acumulados = list(errs)
             for reintento in range(1, MAX_REINTENTOS + 1):
-                print(
-                    f"\n  {YELLOW}[!] {len(errs_acumulados)} errores detectados{RESET}"
-                )
+                print(f"\n  {YELLOW}⚠ {len(errs_acumulados)} errores detectados{RESET}")
                 time.sleep(SLEEP_ENTRE_HILOS)
                 archivos2, errs2, nuevos2, done2, timeout2, duracion2 = (
                     ejecutar_descarga(
@@ -588,40 +515,39 @@ if __name__ == "__main__":
                 if timeout2:
                     timeout = True
                     break
-
                 errs_acumulados = errs2
                 if not errs2:
                     break
-
             errs = errs_acumulados
 
         if timeout:
             timeouts_totales.append(nombre)
             print(
-                f"\n  {RED}[TIMEOUT] Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
+                f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
             )
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"\nURL: {url}\n")
+                f.write(
+                    f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nURL: {url}\n"
+                )
                 if errs:
                     f.write("ERRORES:\n" + "\n".join(errs) + "\n")
-                f.write(f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n")
-                f.write(f"{'=' * 60}\n\n")
+                f.write(
+                    f"TIMEOUT: sin actividad por {TIMEOUT_ACTIVIDAD}s\n{'=' * 60}\n\n"
+                )
             esperar_entre_hilos(i, len(urls))
             continue
 
         with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"\nURL: {url}\n")
+            f.write(
+                f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nURL: {url}\n"
+            )
             if archivos:
-                f.write("\n".join(archivos))
-                f.write("\n\n")
+                f.write("\n".join(archivos) + "\n\n")
             if errs:
                 f.write("ERRORES:\n" + "\n".join(errs))
             else:
                 f.write("Sin errores.")
-            f.write("\n")
-            f.write(f"{'=' * 60}\n\n")
+            f.write(f"\n{'=' * 60}\n\n")
 
         mins, segs = duracion // 60, duracion % 60
         tiempo_str = f"{mins}m {segs}s" if mins > 0 else f"{segs}s"
@@ -636,14 +562,15 @@ if __name__ == "__main__":
                 f"  {YELLOW}[X] {nombre} — {resumen} — {len(errs)} [X] (ver log) — {tiempo_str}{RESET}"
             )
         elif nuevos > 0:
-            print(f"  {GREEN}[+] {nombre} — {resumen} — {tiempo_str}{RESET}")
+            print(f"  {GREEN}[✓] {nombre} — {resumen} — {tiempo_str}{RESET}")
         elif done > 0:
-            print(f"  {GRAY}[+] {nombre} — todo ya descargado ({done} archivos){RESET}")
+            print(f"  {GRAY}[✓] {nombre} — todo ya descargado ({done} archivos){RESET}")
         else:
-            print(f"  {GRAY}[+] {nombre} — sin archivos nuevos{RESET}")
+            print(f"  {GRAY}[✓] {nombre} — sin archivos nuevos{RESET}")
 
         esperar_entre_hilos(i, len(urls))
 
+    # Resumen final
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
         f"{BOLD}  Descarga terminada — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}"
@@ -658,21 +585,9 @@ if __name__ == "__main__":
             print(f"    {n}")
     if not errores_totales and not timeouts_totales:
         print(f"  {GREEN}Todos los hilos sin errores.{RESET}")
-    else:
-        retry_pendientes = 0
-        if os.path.exists(RETRY_FILE):
-            with open(RETRY_FILE, "r", encoding="utf-8") as f:
-                retry_pendientes = sum(
-                    1
-                    for l in f  # noqa: E741
-                    if l.strip() and not l.startswith("#")  # noqa: E741
-                )
-        if retry_pendientes:
-            print(
-                f"\n  {YELLOW}→ {retry_pendientes} URLs en lista_retry.txt — corré auditar.py para analizarlas{RESET}"
-            )
-    print(f"{BOLD}{'═' * 50}{RESET}")
+    print(f"{BOLD}{'═' * 50}{RESET}\n")
 
+    # PASO 5: Consolidación y Limpieza automática del retry
     if os.path.exists(RETRY_FILE):
         with open(RETRY_FILE, encoding="utf-8") as f:
             urls_retry_procesadas = [
@@ -690,5 +605,90 @@ if __name__ == "__main__":
                 f"  {DIM}lista_retry.txt procesada y vaciada — backup en lista_retry_backup.txt{RESET}"
             )
 
-    if IS_WINDOWS:
-        input("\nPresiona Enter para cerrar...")
+
+def elegir_lista():
+    tiene_retry = False
+    retry_count = 0
+    if os.path.exists(RETRY_FILE):
+        with open(RETRY_FILE, encoding="utf-8") as f:
+            lineas_retry = [l.strip() for l in f if l.strip() and not l.startswith("#")]  # noqa: E741
+        tiene_retry = bool(lineas_retry)
+        retry_count = len(lineas_retry)
+
+    os.system("cls" if os.name == "nt" else "clear")
+    print(f"{BOLD}{'═' * 50}{RESET}")
+    print(
+        f"{BOLD}  {'Windows' if IS_WINDOWS else 'Linux/WSL'} — seleccioná una opción{RESET}"
+    )
+    print(f"{BOLD}{'═' * 50}{RESET}\n")
+    print(f"  {GREEN}[1]{RESET} lista.txt          {GRAY}(descarga normal){RESET}")
+
+    if tiene_retry:
+        print(
+            f"  {MAGENTA}[2]{RESET} lista_retry.txt    {GRAY}({retry_count} URLs pendientes){RESET}"
+        )
+    else:
+        print(f"  {DIM}[2] lista_retry.txt  (vacía o inexistente){RESET}")
+
+    print(
+        f"  {CYAN}[3]{RESET} auditar            {GRAY}(analizar logs y generar retry){RESET}"
+    )
+    print(f"  {GRAY}[4]{RESET} salir")
+    print()
+
+    while True:
+        try:
+            opcion = input(f"  Opción {WHITE}[1/2/3/4]{RESET}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ("SALIR", None)
+
+        if opcion == "1":
+            return ("DESCARGA", LISTA)
+        elif opcion == "2":
+            if not tiene_retry:
+                print(f"  {RED}lista_retry.txt está vacía o no existe.{RESET}")
+                continue
+            return ("DESCARGA", RETRY_FILE)
+        elif opcion == "3":
+            return ("AUDITAR", None)
+        elif opcion == "4":
+            return ("SALIR", None)
+        else:
+            print(f"  {YELLOW}Ingresá 1, 2, 3 o 4.{RESET}")
+
+
+# ==========================================
+# INTERFAZ INTERACTIVA CENTRAL (REPL)
+# ==========================================
+if __name__ == "__main__":
+    while True:
+        accion, payload = elegir_lista()
+
+        if accion == "SALIR":
+            break
+
+        elif accion == "AUDITAR":
+            print(f"\n  {CYAN}Ejecutando auditar.py en subproceso aislado...{RESET}\n")
+            # El búnker del subproceso: protege tu menú si la auditoría falla
+            subprocess.run([sys.executable, "auditar.py"])
+            print()
+            if IS_WINDOWS:
+                input(f"  {GRAY}Presioná Enter para volver al menú...{RESET}")
+            continue
+
+        elif accion == "DESCARGA":
+            es_retry_run = payload == RETRY_FILE
+            with open(payload, "r", encoding="utf-8") as f:
+                urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
+
+            if not urls:
+                print(f"\n  {YELLOW}El archivo está vacío.{RESET}\n")
+                if IS_WINDOWS:
+                    input(f"  {GRAY}Presioná Enter para volver al menú...{RESET}")
+                continue
+
+            procesar_descargas(urls, es_retry_run=es_retry_run)
+
+            if IS_WINDOWS:
+                input(f"  {GRAY}Presioná Enter para volver al menú...{RESET}")
