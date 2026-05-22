@@ -631,14 +631,14 @@ def elegir_lista():
     retry_count = 0
     if os.path.exists(RETRY_FILE):
         with open(RETRY_FILE, "r", encoding="utf-8") as f:
-            lineas_retry = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+            lineas_retry = [l.strip() for l in f if l.strip() and not l.startswith("#")]  # noqa: E741
         tiene_retry = bool(lineas_retry)
         retry_count = len(lineas_retry)
 
     os.system("cls" if os.name == "nt" else "clear")
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
-        f"  {'Windows' if IS_WINDOWS else 'Linux/WSL'} — seleccioná una opción{RESET}"
+        f"  {'Windows' if IS_WINDOWS else 'Linux/WSL'} — selecciona una opción{RESET}"
     )
     print(f"{BOLD}{'═' * 50}{RESET}\n")
     print(f"  {GREEN}[1]{RESET} lista.txt          {GRAY}(descarga normal){RESET}")
@@ -675,7 +675,7 @@ def elegir_lista():
         elif opcion == "4":
             return ("SALIR", None)
         else:
-            print(f"  {YELLOW}Ingresá 1, 2, 3 o 4.{RESET}")
+            print(f"  {YELLOW}Ingresa 1, 2, 3 o 4.{RESET}")
 
 
 # ==========================================
@@ -693,7 +693,7 @@ if __name__ == "__main__":
             subprocess.run([sys.executable, "auditar.py"])
             print()
             if IS_WINDOWS:
-                input(f"  {GRAY}Presioná Enter para volver al menú...{RESET}")
+                input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")
             continue
 
         elif accion == "DESCARGA":
@@ -750,7 +750,7 @@ if __name__ == "__main__":
                         f"\n  {RED}[X] Error crítico leyendo archivo de reintentos: {e}{RESET}\n"
                     )
                     if IS_WINDOWS:
-                        input(f"  {GRAY}Presioná Enter para volver al menú...{RESET}")
+                        input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")
                     continue
             else:
                 with open(payload, "r", encoding="utf-8") as f:
@@ -761,10 +761,10 @@ if __name__ == "__main__":
                     f"\n  {YELLOW}El archivo está vacío o no contiene URLs válidas.{RESET}\n"
                 )
                 if IS_WINDOWS:
-                    input(f"  {GRAY}Presioná Enter para volver al menú...{RESET}")
+                    input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")
                 continue
 
             procesar_descargas(urls, es_retry_run=es_retry_run)
 
             if IS_WINDOWS:
-                input(f"  {GRAY}Presioná Enter para volver al menú...{RESET}")
+                input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")

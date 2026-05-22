@@ -3,19 +3,29 @@ import csv
 import os
 import re
 import sys
+import time
 import zipfile
 from datetime import datetime
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
+IS_WINDOWS = sys.platform == "win32"
+
 # ==========================================
-# CONFIGURACIÓN DE RUTAS FIJAS (WINDOWS)
+# CONFIGURACIÓN DE RUTAS MULTIPLATAFORMA
 # ==========================================
-RIPS_DIR = r"G:\Rips"
-LOG_DIR = r"G:\Rips\logs"
-RETRY_FILE = r"C:\gallery-dl\lista_retry.txt"
-HISTORIAL_CSV = r"C:\gallery-dl\historial_fallos.csv"
+if IS_WINDOWS:
+    RIPS_DIR = r"G:\Rips"
+    LOG_DIR = r"G:\Rips\logs"
+    RETRY_FILE = r"C:\gallery-dl\lista_retry.txt"
+    HISTORIAL_CSV = r"C:\gallery-dl\historial_fallos.csv"
+else:
+    RIPS_DIR = os.path.expanduser("~/Rips")
+    LOG_DIR = os.path.expanduser("~/Rips/logs")
+    RETRY_FILE = os.path.expanduser("~/gallery-dl/lista_retry.txt")
+    HISTORIAL_CSV = os.path.expanduser("~/gallery-dl/historial_fallos.csv")
+
 ZIP_FILE = os.path.join(LOG_DIR, f"logs_{datetime.now().strftime('%Y-%m-%d')}.zip")
 
 # Paletas de Color ANSI para Reporte Forense
@@ -94,7 +104,6 @@ def archivar_log_en_zip(ruta_log):
 
 def purgar_zip_antiguos(dias_retencion=60):
     """Busca y elimina archivos ZIP de logs que superen los días de retención establecidos."""
-    import time
 
     if not os.path.exists(LOG_DIR):
         return
@@ -160,7 +169,6 @@ def analizar_logs():
 
     for archivo in logs_a_procesar:
         ruta_completa = os.path.join(LOG_DIR, archivo)
-        # El nombre del archivo log define el nombre exacto de la carpeta destino
         nombre_carpeta = os.path.splitext(archivo)[0]
 
         try:
@@ -182,18 +190,16 @@ def analizar_logs():
                             registrar_en_csv(id_llave, url, "FATAL", linea)
                         else:
                             conteo_transitorios += 1
-                            # Guardamos la URL amarrada a sus metadatos de origen
                             diccionario_retry[url] = (id_llave, nombre_carpeta)
                             mapeo_reporte_retry[id_llave] = (
                                 mapeo_reporte_retry.get(id_llave, 0) + 1
                             )
                             registrar_en_csv(id_llave, url, "TRANSITORIO", linea)
 
+            archivar_log_en_zip(ruta_completa)
         except Exception as e:
             print(f"  {YELLOW}[!] Advertencia leyendo {archivo}: {e}{RESET}")
             continue
-
-        archivar_log_en_zip(ruta_completa)
 
     # Escritura Enriquecida con Bloques de Control Meta
     if diccionario_retry:
@@ -238,9 +244,10 @@ def imprimir_reporte(total_logs, fatales, transitorios, mapeo_reporte_retry, hue
         print(
             f"  Archivos .part huérfanos por Timeout   : {BOLD}{YELLOW}{len(huerfanos)}{RESET}"
         )
+        sep = "\\" if IS_WINDOWS else "/"
         for path in huerfanos:
             print(
-                f"    {RED}└── Corrupto:{RESET} {GRAY}...\\{os.path.basename(os.path.dirname(path))}\\{os.path.basename(path)}{RESET}"
+                f"    {RED}└── Corrupto:{RESET} {GRAY}...{sep}{os.path.basename(os.path.dirname(path))}{sep}{os.path.basename(path)}{RESET}"
             )
         print()
     else:
