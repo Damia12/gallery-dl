@@ -36,6 +36,8 @@ else:
     RETRY_FILE = os.path.expanduser("~/gallery-dl/lista_retry.txt")
     BACKUP_FILE = os.path.expanduser("~/gallery-dl/lista_retry_backup.txt")
 
+RIPS_DIR = r"G:\Rips" if IS_WINDOWS else os.path.expanduser("~/Rips")
+
 SLEEP_ENTRE_HILOS = 30
 TIMEOUT_ACTIVIDAD = 300
 TIMEOUT_SIN_ARCHIVOS = 600
@@ -480,21 +482,16 @@ def procesar_descargas(urls, es_retry_run=False):
         if isinstance(item, dict):
             url = item["url"]
             extra_flags = item["extra_flags"]
-            plan_msg = item["plan_msg"]
         else:
             url = item
             extra_flags = None
-            plan_msg = None
 
         nombre = url.rstrip("/").split("/")[-1][:60]
         nombre_modelo = formatear_nombre_modelo(nombre)
         log_file = os.path.join(LOG_DIR, f"{nombre}.log")
 
         print(f"{BOLD}[{i}/{len(urls)}]{RESET} {CYAN}{nombre}{RESET}")
-        print(f"  {GRAY}{url}{RESET}")
-        if plan_msg:
-            print(plan_msg)
-        print()
+        print(f"  {GRAY}{url}{RESET}\n")
 
         archivos, errs, nuevos, done, timeout, duracion = ejecutar_descarga(
             url=url, nombre_modelo=nombre_modelo, intento=1, extra_flags=extra_flags
@@ -622,7 +619,7 @@ def procesar_descargas(urls, es_retry_run=False):
                 fb.write("\n")
             os.remove(RETRY_FILE)
             print(
-                f"  {DIM}lista_retry.txt procesada y vaciada — backup en lista_retry_backup.txt{RESET}"
+                f"  {DIM}lista_retry.txt processed and emptied — backup en lista_retry_backup.txt{RESET}"
             )
 
 
@@ -722,11 +719,10 @@ if __name__ == "__main__":
 
                             if linea.startswith("http"):
                                 extra_flags = None
-                                plan_msg = f"  {YELLOW}[Plan B] -> Enlace plano o META ausente. Ruta por defecto.{RESET}"
 
                                 if meta_actual and meta_actual["id"] != "Desconocido":
                                     ruta_destino = os.path.join(
-                                        r"G:\Rips\Simpcity", meta_actual["folder"]
+                                        RIPS_DIR, "Simpcity", meta_actual["folder"]
                                     )
                                     prefijo_nombre = f"{meta_actual['id']}_{{filename}}.{{extension}}"
                                     extra_flags = [
@@ -735,13 +731,11 @@ if __name__ == "__main__":
                                         "-o",
                                         f"filename={prefijo_nombre}",
                                     ]
-                                    plan_msg = f"  {GREEN}[Plan A] -> Post ID: {meta_actual['id']} | Carpeta: {meta_actual['folder']}{RESET}"
 
                                 urls.append(
                                     {
                                         "url": linea,
                                         "extra_flags": extra_flags,
-                                        "plan_msg": plan_msg,
                                     }
                                 )
                                 meta_actual = None
