@@ -1,5 +1,6 @@
 descargas/
 *.exe
+*.csv
 archive.db
 errores.log
 lista.txt
