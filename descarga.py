@@ -143,8 +143,8 @@ def limpiar_error(linea):
 #   speed           → velocidad            (Linux vía PTY, Windows = "")
 # =============================================================================
 def spinner_thread(estado, lock_print):
-    """Hilo de spinner unificado. En Linux muestra datos reales de progreso
-    cuando están disponibles; en Windows muestra tiempo + conteo."""
+    """Hilo de spinner unificado. Muestra la última línea de actividad
+    encima de la barra animada para que siempre sea visible."""
     idx = 0
     ancho_barra = 24
     while not estado["stop"]:
@@ -157,9 +157,9 @@ def spinner_thread(estado, lock_print):
 
         pct = estado.get("pct", -1)
         speed = estado.get("speed", "")
+        ultima_linea = estado.get("ultima_linea", "")
 
         if pct >= 0:
-            # ── Barra de progreso real (Linux con datos del PTY) ─────────────
             llenos = int(ancho_barra * pct / 100)
             vacios = ancho_barra - llenos
             barra_interna = ("━" * llenos) + ("·" * vacios)
@@ -174,13 +174,18 @@ def spinner_thread(estado, lock_print):
 
             anim = SPINNER[idx % len(SPINNER)]
             with lock_print:
+                # Línea de actividad actual encima de la barra
+                if ultima_linea:
+                    sys.stdout.write(f"\r\033[2K{ultima_linea}\n")
                 sys.stdout.write(
                     f"\r  {ACCENT}{anim}{RESET} {barra_visual} "
                     f"{pct:>3}% │{size_info}{speed_info} {DIM}{resumen} — {tiempo}{RESET}\033[K"
                 )
+                # Volver arriba para sobreescribir en el próximo tick
+                if ultima_linea:
+                    sys.stdout.write("\033[1A")
                 sys.stdout.flush()
         else:
-            # ── Barra animada inventada (Windows o Linux sin progreso aún) ───
             pos = idx % (ancho_barra + 4)
             barra_lista = ["·"] * ancho_barra
             for i in range(4):
@@ -193,10 +198,14 @@ def spinner_thread(estado, lock_print):
             anim = SPINNER[idx % len(SPINNER)]
             speed_info = f" │ {speed}" if speed else ""
             with lock_print:
+                if ultima_linea:
+                    sys.stdout.write(f"\r\033[2K{ultima_linea}\n")
                 sys.stdout.write(
                     f"\r  {ACCENT}{anim}{RESET} {barra_visual} "
                     f"{DIM}{resumen}{speed_info} — {tiempo}{RESET}\033[K"
                 )
+                if ultima_linea:
+                    sys.stdout.write("\033[1A")
                 sys.stdout.flush()
 
         idx += 1
@@ -283,6 +292,7 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
         "speed": "",
         "descargado": "",
         "total": "",
+        "ultima_linea": "",
     }
     estado_watchdog = {
         "stop": False,
@@ -340,23 +350,25 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
 
             with lock_print:
                 estado_watchdog["ultimo_output"] = time.time()
-                clear_line()
+                estado_watchdog["ultimo_archivo"] = time.time()
+                contador["seq"] += 1
 
                 if linea_strip.startswith("#"):
                     estado_spinner["done"] += 1
-                    estado_watchdog["ultimo_archivo"] = time.time()
-                    contador["seq"] += 1
                     ruta = linea_strip[1:].strip()
-                    print(
-                        f"  {GRAY}[{contador['seq']:>3}] [DONE] {nombre_modelo} - {nombre_visible(ruta)}{RESET}"
+                    # Imprimir DONE como línea fija y limpiar ultima_linea
+                    clear_line()
+                    sys.stdout.write(
+                        f"  {GRAY}[{contador['seq']:>3}] [DONE] {nombre_modelo} - {nombre_visible(ruta)}{RESET}\n"
                     )
+                    sys.stdout.flush()
+                    estado_spinner["ultima_linea"] = ""
                 else:
                     estado_spinner["nuevo"] += 1
-                    estado_watchdog["ultimo_archivo"] = time.time()
-                    contador["seq"] += 1
                     archivos_nuevos.append(linea_strip)
-                    print(
-                        f"  {GREEN}[{contador['seq']:>3}] {RESET} {nombre_modelo} - {nombre_visible(linea_strip)}"
+                    # Guardar como línea activa — el spinner la muestra encima de la barra
+                    estado_spinner["ultima_linea"] = (
+                        f"  {GREEN}[{contador['seq']:>3}] {RESET}{nombre_modelo} - {nombre_visible(linea_strip)}"
                     )
     finally:
         try:
@@ -417,6 +429,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
         "speed": "",
         "descargado": "",
         "total": "",
+        "ultima_linea": "",
     }
 
     sys.stdout.write("\033[?25l")
@@ -562,12 +575,11 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
                     contador_seq += 1
 
                     with lock_print:
-                        # Al imprimir una línea nueva, resetear progreso
-                        # para que el spinner vuelva a la barra animada
                         estado_spinner["pct"] = -1
                         estado_spinner["descargado"] = ""
                         estado_spinner["total"] = ""
                         estado_spinner["speed"] = ""
+                        estado_spinner["ultima_linea"] = ""
 
                         clear_line()
                         if es_done:
