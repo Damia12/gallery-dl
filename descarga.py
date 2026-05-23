@@ -745,6 +745,7 @@ if __name__ == "__main__":
         elif accion == "DESCARGA":
             es_retry_run = payload == RETRY_FILE
             urls = []
+            vistos = set()  # Control de deduplicación en RAM
 
             if es_retry_run:
                 meta_actual = None
@@ -767,6 +768,11 @@ if __name__ == "__main__":
                                 continue
 
                             if linea.startswith("http"):
+                                if linea in vistos:
+                                    meta_actual = None
+                                    continue
+                                vistos.add(linea)
+
                                 extra_flags = None
 
                                 if meta_actual and meta_actual["id"] != "Desconocido":
@@ -793,7 +799,15 @@ if __name__ == "__main__":
                     continue
             else:
                 with open(payload, "r", encoding="utf-8") as f:
-                    urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
+                    for u in f:
+                        u = u.strip()
+                        if not u or u.startswith("#"):
+                            continue
+                        match_id = re.search(r"\.(\d+)/?$", u)
+                        id_unico = match_id.group(1) if match_id else u
+                        if id_unico not in vistos:
+                            vistos.add(id_unico)
+                            urls.append(u)
 
             if not urls:
                 print(
