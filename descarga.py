@@ -45,6 +45,7 @@ TIMEOUT_SIN_ARCHIVOS = 600
 MAX_REINTENTOS = 2
 
 os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(RIPS_DIR, exist_ok=True)
 
 # Estilos y Colores ANSI
 RESET = "\033[0m"
@@ -63,6 +64,7 @@ SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 spinner_idx = 0
 
 ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+RE_PREFIJO_NUM = re.compile(r"^\d+\s+")
 RE_PROGRESS = re.compile(
     r"(\d+)%\s+([\d.]+)\s*([KkMmGgTt]?[Bb])\s+([\d.]+)\s*([KkMmGgTt]?[Bb]/s)",
     re.IGNORECASE,
@@ -408,6 +410,11 @@ def descargar_linux(url, nombre_modelo, extra_flags=None):
                     if not linea_limpia:
                         continue
 
+                    if (
+                        "cookies" in linea_limpia.lower()
+                        or "extracted" in linea_limpia.lower()
+                    ):
+                        continue
                     if "%" in linea_limpia and any(
                         x in linea_limpia for x in ["MB", "KB", "B/s"]
                     ):
@@ -423,8 +430,20 @@ def descargar_linux(url, nombre_modelo, extra_flags=None):
                         continue
                     ultima_ruta = linea_pura
 
-                    partes = linea_pura.split(" ", 1)
-                    nombre_visible_str = partes[1] if len(partes) > 1 else linea_pura
+                    nombre_sin_prefijo = (
+                        RE_PREFIJO_NUM.sub("", linea_pura)
+                        if RE_PREFIJO_NUM.match(linea_pura)
+                        else linea_pura
+                    )
+                    carpeta_visible = os.path.basename(
+                        os.path.dirname(nombre_sin_prefijo)
+                    )
+                    archivo_visible = os.path.basename(nombre_sin_prefijo)
+                    nombre_visible_str = (
+                        f"{carpeta_visible} {archivo_visible}"
+                        if carpeta_visible
+                        else archivo_visible
+                    )
                     contador_seq += 1
 
                     if es_done:
@@ -665,7 +684,6 @@ def elegir_lista():
         tiene_retry = bool(lineas_retry)
         retry_count = len(lineas_retry)
 
-    os.system("cls" if os.name == "nt" else "clear")
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
         f"  {'Windows' if IS_WINDOWS else 'Linux/WSL'} — selecciona una opción{RESET}"
@@ -823,6 +841,7 @@ if __name__ == "__main__":
                 f"\n  {GRAY}Proceso completado. Presiona Enter para volver al menú...{RESET}"
             )
             input()
+            break
 
             # if IS_WINDOWS:
             #     input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")
