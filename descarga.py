@@ -70,7 +70,14 @@ RE_PROGRESS = re.compile(
 )
 
 KEYWORDS_ERROR = ["error", "warning", "failed", "unsupported", "unable", "exception"]
-KEYWORDS_RUIDO = ["theme-light", "color-", "--rem", "None_"]
+KEYWORDS_RUIDO = [
+    "theme-light",
+    "color-",
+    "--rem",
+    "None_",
+    "extracted",
+    "cookies from",
+]
 
 
 def clear_line():
@@ -407,6 +414,10 @@ def descargar_linux(url, nombre_modelo, extra_flags=None):
                 if es_linea_complete:
                     linea_limpia = linea.strip()
                     if not linea_limpia:
+                        continue
+
+                    linea_pura_check = ANSI_ESCAPE.sub("", linea_limpia).lower()
+                    if any(k in linea_pura_check for k in KEYWORDS_RUIDO):
                         continue
 
                     if "%" in linea_limpia and any(
