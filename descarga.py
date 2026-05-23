@@ -819,5 +819,10 @@ if __name__ == "__main__":
 
             procesar_descargas(urls, es_retry_run=es_retry_run)
 
-            if IS_WINDOWS:
-                input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")
+            print(
+                f"\n  {GRAY}Proceso completado. Presiona Enter para volver al menú...{RESET}"
+            )
+            input()
+
+            # if IS_WINDOWS:
+            #     input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")
