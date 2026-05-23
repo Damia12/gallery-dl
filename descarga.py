@@ -45,7 +45,6 @@ TIMEOUT_SIN_ARCHIVOS = 600
 MAX_REINTENTOS = 2
 
 os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(RIPS_DIR, exist_ok=True)
 
 # Estilos y Colores ANSI
 RESET = "\033[0m"
@@ -410,11 +409,6 @@ def descargar_linux(url, nombre_modelo, extra_flags=None):
                     if not linea_limpia:
                         continue
 
-                    if (
-                        "cookies" in linea_limpia.lower()
-                        or "extracted" in linea_limpia.lower()
-                    ):
-                        continue
                     if "%" in linea_limpia and any(
                         x in linea_limpia for x in ["MB", "KB", "B/s"]
                     ):
@@ -423,7 +417,11 @@ def descargar_linux(url, nombre_modelo, extra_flags=None):
                         continue
 
                     es_done = "\x1b[2m" in linea_limpia
-                    es_error = es_linea_error(linea_limpia)
+                    es_error = (
+                        es_linea_error(linea_limpia)
+                        or "connection broken" in linea_limpia.lower()
+                        or "incompleteread" in linea_limpia.lower()
+                    )
                     linea_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
 
                     if not linea_pura or linea_pura == ultima_ruta:
@@ -684,6 +682,7 @@ def elegir_lista():
         tiene_retry = bool(lineas_retry)
         retry_count = len(lineas_retry)
 
+    os.system("cls" if os.name == "nt" else "clear")
     print(f"{BOLD}{'═' * 50}{RESET}")
     print(
         f"  {'Windows' if IS_WINDOWS else 'Linux/WSL'} — selecciona una opción{RESET}"
@@ -838,10 +837,9 @@ if __name__ == "__main__":
             procesar_descargas(urls, es_retry_run=es_retry_run)
 
             print(
-                f"\n  {GRAY}Proceso completado. Presiona Enter para volver al menú...{RESET}"
+                f"\n  {GRAY}Proceso completado. Presiona Enter para terminar...{RESET}"
             )
             input()
             break
-
             # if IS_WINDOWS:
             #     input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")
