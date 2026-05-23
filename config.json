@@ -1,0 +1,32 @@
+{
+  "windows": {
+    "paths": {
+      "rips_dir": "G:/Rips",
+      "log_dir": "G:/Rips/logs",
+      "lista_file": "C:/gallery-dl/lista.txt",
+      "state_file": "C:/gallery-dl/state.json",
+      "audit_csv": "G:/Rips/logs/auditoria_errores.csv"
+    },
+    "gallery_dl": {
+      "executable": "gallery-dl.exe",
+      "config_file": "C:/gallery-dl/gallery-dl_win.conf"
+    }
+  },
+  "linux": {
+    "paths": {
+      "rips_dir": "/home/felipe/Rips",
+      "log_dir": "/home/felipe/Rips/logs",
+      "lista_file": "/home/felipe/gallery-dl/lista.txt",
+      "state_file": "/home/felipe/gallery-dl/state.json",
+      "audit_csv": "/home/felipe/Rips/logs/auditoria_errores.csv"
+    },
+    "gallery_dl": {
+      "executable": "gallery-dl",
+      "config_file": "/home/felipe/gallery-dl/gallery-dl_linux.conf"
+    }
+  },
+  "pipeline": {
+    "batch_size": 1,
+    "workers": 1
+  }
+}
