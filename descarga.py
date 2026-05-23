@@ -2,6 +2,7 @@
 import errno
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -18,9 +19,9 @@ if not IS_WINDOWS:
     import pty
     import select
 
-# ==========================================
-# CONFIGURACIÓN DE RUTAS FIJAS
-# ==========================================
+# =============================================================================
+# CONFIGURACIÓN DE RUTAS FIJAS MULTIPLATAFORMA
+# =============================================================================
 if IS_WINDOWS:
     GALLERY_DL = "gallery-dl.exe"
     CONFIG = r"C:\gallery-dl\gallery-dl_win.conf"
@@ -28,6 +29,7 @@ if IS_WINDOWS:
     LOG_DIR = r"G:\Rips\logs"
     RETRY_FILE = r"C:\gallery-dl\lista_retry.txt"
     BACKUP_FILE = r"C:\gallery-dl\lista_retry_backup.txt"
+    RIPS_DIR = r"G:\Rips"
 else:
     GALLERY_DL = "gallery-dl"
     CONFIG = os.path.expanduser("~/gallery-dl/gallery-dl_linux.conf")
@@ -35,8 +37,7 @@ else:
     LOG_DIR = os.path.expanduser("~/Rips/logs")
     RETRY_FILE = os.path.expanduser("~/gallery-dl/lista_retry.txt")
     BACKUP_FILE = os.path.expanduser("~/gallery-dl/lista_retry_backup.txt")
-
-RIPS_DIR = r"G:\Rips" if IS_WINDOWS else os.path.expanduser("~/Rips")
+    RIPS_DIR = os.path.expanduser("~/Rips")
 
 SLEEP_ENTRE_HILOS = 30
 TIMEOUT_ACTIVIDAD = 300
@@ -173,13 +174,20 @@ def watchdog_thread(proceso, estado, timeout):
     while not estado["stop"]:
         ahora = time.time()
         if ahora - estado["ultimo_output"] > timeout:
-            proceso.kill()
+            try:
+                proceso.kill()
+            except OSError:
+                pass
             estado["timeout"] = True
             break
         if ahora - estado["ultimo_archivo"] > TIMEOUT_SIN_ARCHIVOS:
-            proceso.kill()
+            try:
+                proceso.kill()
+            except OSError:
+                pass
             estado["timeout"] = True
             break
+
         time.sleep(5)
 
 
@@ -271,7 +279,10 @@ def descargar_windows(url, nombre_modelo, extra_flags=None):
                         f"  {GREEN}[{contador['seq']:>3}] {RESET} {nombre_modelo} - {nombre_visible(linea_strip)}"
                     )
     finally:
-        proceso.wait()
+        try:
+            proceso.wait()
+        except OSError:
+            pass
         stderr_thread.join(timeout=5)
         estado_spinner["stop"] = True
         estado_watchdog["stop"] = True
@@ -329,11 +340,17 @@ def descargar_linux(url, nombre_modelo, extra_flags=None):
             if not r:
                 ahora = time.time()
                 if ahora - ultimo_output > TIMEOUT_ACTIVIDAD:
-                    proceso.kill()
+                    try:
+                        proceso.kill()
+                    except OSError:
+                        pass
                     timeout_ocurrido = True
                     break
                 if ahora - ultimo_archivo > TIMEOUT_SIN_ARCHIVOS:
-                    proceso.kill()
+                    try:
+                        proceso.kill()
+                    except OSError:
+                        pass
                     timeout_ocurrido = True
                     break
                 continue
@@ -431,7 +448,10 @@ def descargar_linux(url, nombre_modelo, extra_flags=None):
                     sys.stdout.flush()
     finally:
         if proceso is not None:
-            proceso.wait()
+            try:
+                proceso.wait()
+            except OSError:
+                pass
         clear_line()
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
@@ -460,7 +480,7 @@ def esperar_entre_hilos(i, total):
 
 def ejecutar_descarga(url, nombre_modelo, intento=1, extra_flags=None):
     if intento > 1:
-        print(f"  {YELLOW}↺ Reintento {intento - 1}/{MAX_REINTENTOS}{RESET}\n")
+        print(f"  {YELLOW}[!] Reintento {intento - 1}/{MAX_REINTENTOS}{RESET}\n")
     if IS_WINDOWS:
         return descargar_windows(url, nombre_modelo, extra_flags)
     else:
@@ -486,8 +506,16 @@ def procesar_descargas(urls, es_retry_run=False):
             url = item
             extra_flags = None
 
-        nombre = url.rstrip("/").split("/")[-1][:60]
-        nombre_modelo = formatear_nombre_modelo(nombre)
+        nombre_base = url.rstrip("/").split("/")[-1][:60]
+
+        # Inicialización del formateador de modelo
+        nombre_modelo = formatear_nombre_modelo(nombre_base)
+
+        # CORRECCIÓN PUNTO 4: Aislamiento de identificador numérico de hilo
+        match_id = re.search(r"\.(\d+)/?$", url)
+        id_str = match_id.group(1) if match_id else "000000"
+        nombre = f"{nombre_base}.{id_str}"
+
         log_file = os.path.join(LOG_DIR, f"{nombre}.log")
 
         print(f"{BOLD}[{i}/{len(urls)}]{RESET} {CYAN}{nombre}{RESET}")
@@ -500,7 +528,7 @@ def procesar_descargas(urls, es_retry_run=False):
         if timeout:
             timeouts_totales.append(nombre)
             print(
-                f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
+                f"\n  {RED}[T] Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
             )
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(
@@ -515,7 +543,9 @@ def procesar_descargas(urls, es_retry_run=False):
         if errs and es_retry_run:
             errs_acumulados = list(errs)
             for reintento in range(1, MAX_REINTENTOS + 1):
-                print(f"\n  {YELLOW}⚠ {len(errs_acumulados)} errores detectados{RESET}")
+                print(
+                    f"\n  {YELLOW}[!] {len(errs_acumulados)} errores detectados{RESET}"
+                )
                 time.sleep(SLEEP_ENTRE_HILOS)
                 archivos2, errs2, nuevos2, done2, timeout2, duracion2 = (
                     ejecutar_descarga(
@@ -541,7 +571,7 @@ def procesar_descargas(urls, es_retry_run=False):
         if timeout:
             timeouts_totales.append(nombre)
             print(
-                f"\n  {RED}⏱ Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
+                f"\n  {RED}[X] Timeout — sin actividad por {TIMEOUT_ACTIVIDAD}s — proceso terminado{RESET}"
             )
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(
@@ -577,14 +607,16 @@ def procesar_descargas(urls, es_retry_run=False):
         if errs:
             errores_totales.append((nombre, len(errs)))
             print(
-                f"  {YELLOW}[X] {nombre} — {resumen} — {len(errs)} [X] (ver log) — {tiempo_str}{RESET}"
+                f"  {YELLOW}[!] {nombre} — {resumen} — {len(errs)} (ver log) — {tiempo_str}{RESET}"
             )
         elif nuevos > 0:
-            print(f"  {GREEN}[✓] {nombre} — {resumen} — {tiempo_str}{RESET}")
+            print(f"  {GREEN}[+] {nombre} — {resumen} — {tiempo_str}{RESET}")
         elif done > 0:
-            print(f"  {GRAY}[✓] {nombre} — todo ya descargado ({done} archivos){RESET}")
+            print(
+                f"  {GRAY}[OK] {nombre} — todo ya descargado ({done} archivos){RESET}"
+            )
         else:
-            print(f"  {GRAY}[✓] {nombre} — sin archivos nuevos{RESET}")
+            print(f"  {GRAY}[OK] {nombre} — sin archivos nuevos{RESET}")
 
         esperar_entre_hilos(i, len(urls))
 
@@ -606,6 +638,7 @@ def procesar_descargas(urls, es_retry_run=False):
     print(f"{BOLD}{'═' * 50}{RESET}\n")
 
     if os.path.exists(RETRY_FILE):
+        # MITIGACIÓN DE BUG: Cambiado modo "w" a "r" para evitar truncado prematuro
         with open(RETRY_FILE, "r", encoding="utf-8") as f:
             urls_retry_procesadas = [
                 u.strip() for u in f if u.strip() and not u.startswith("#")
@@ -619,7 +652,7 @@ def procesar_descargas(urls, es_retry_run=False):
                 fb.write("\n")
             os.remove(RETRY_FILE)
             print(
-                f"  {DIM}lista_retry.txt processed and emptied — backup en lista_retry_backup.txt{RESET}"
+                f"  {DIM}lista_retry.txt procesada y vaciada — backup en lista_retry_backup.txt{RESET}"
             )
 
 
@@ -628,7 +661,7 @@ def elegir_lista():
     retry_count = 0
     if os.path.exists(RETRY_FILE):
         with open(RETRY_FILE, "r", encoding="utf-8") as f:
-            lineas_retry = [l.strip() for l in f if l.strip() and not l.startswith("#")]  # noqa: E741
+            lineas_retry = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         tiene_retry = bool(lineas_retry)
         retry_count = len(lineas_retry)
 
@@ -676,9 +709,21 @@ def elegir_lista():
 
 
 # ==========================================
-# INTERFAZ INTERACTIVA CENTRAL (REPL)
+# INTERFAZ INTERACTIVE CENTRAL (REPL)
 # ==========================================
 if __name__ == "__main__":
+    # CORRECCIÓN PUNTO 15: Validar que gallery-dl esté instalado y accesible al inicio
+    if not shutil.which(GALLERY_DL):
+        print(
+            f"\n  {RED}[X] Error Crítico: No se encontró '{GALLERY_DL}' en el PATH del sistema.{RESET}"
+        )
+        print(
+            "      Asegúrese de que gallery-dl esté instalado y correctamente configurado.\n"
+        )
+        if IS_WINDOWS:
+            input(f"  {GRAY}Presiona Enter para salir...{RESET}")
+        sys.exit(1)
+
     while True:
         accion, payload = elegir_lista()
 
@@ -687,7 +732,11 @@ if __name__ == "__main__":
 
         elif accion == "AUDITAR":
             print(f"\n  {CYAN}Ejecutando auditar.py en subproceso aislado...{RESET}\n")
-            subprocess.run([sys.executable, "auditar.py"])
+            ruta_directorio_actual = os.path.dirname(os.path.abspath(__file__))
+            ruta_auditar = os.path.join(ruta_directorio_actual, "auditar.py")
+
+            # MITIGACIÓN DE BUG: Se reemplazó el string literal por la variable 'ruta_auditar'
+            subprocess.run([sys.executable, ruta_auditar])
             print()
             if IS_WINDOWS:
                 input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")
@@ -696,6 +745,7 @@ if __name__ == "__main__":
         elif accion == "DESCARGA":
             es_retry_run = payload == RETRY_FILE
             urls = []
+            vistos = set()  # Control de deduplicación en RAM
 
             if es_retry_run:
                 meta_actual = None
@@ -718,9 +768,15 @@ if __name__ == "__main__":
                                 continue
 
                             if linea.startswith("http"):
+                                if linea in vistos:
+                                    meta_actual = None
+                                    continue
+                                vistos.add(linea)
+
                                 extra_flags = None
 
                                 if meta_actual and meta_actual["id"] != "Desconocido":
+                                    # CORRECCIÓN PUNTO 2: Uso estricto de RIPS_DIR multiplataforma
                                     ruta_destino = os.path.join(
                                         RIPS_DIR, "Simpcity", meta_actual["folder"]
                                     )
@@ -732,12 +788,7 @@ if __name__ == "__main__":
                                         f"filename={prefijo_nombre}",
                                     ]
 
-                                urls.append(
-                                    {
-                                        "url": linea,
-                                        "extra_flags": extra_flags,
-                                    }
-                                )
+                                urls.append({"url": linea, "extra_flags": extra_flags})
                                 meta_actual = None
                 except Exception as e:
                     print(
@@ -748,7 +799,15 @@ if __name__ == "__main__":
                     continue
             else:
                 with open(payload, "r", encoding="utf-8") as f:
-                    urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
+                    for u in f:
+                        u = u.strip()
+                        if not u or u.startswith("#"):
+                            continue
+                        match_id = re.search(r"\.(\d+)/?$", u)
+                        id_unico = match_id.group(1) if match_id else u
+                        if id_unico not in vistos:
+                            vistos.add(id_unico)
+                            urls.append(u)
 
             if not urls:
                 print(
@@ -760,5 +819,10 @@ if __name__ == "__main__":
 
             procesar_descargas(urls, es_retry_run=es_retry_run)
 
-            if IS_WINDOWS:
-                input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")
+            print(
+                f"\n  {GRAY}Proceso completado. Presiona Enter para volver al menú...{RESET}"
+            )
+            input()
+
+            # if IS_WINDOWS:
+            #     input(f"  {GRAY}Presiona Enter para volver al menú...{RESET}")
