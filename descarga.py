@@ -366,10 +366,14 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
                 else:
                     estado_spinner["nuevo"] += 1
                     archivos_nuevos.append(linea_strip)
-                    # Guardar como línea activa — el spinner la muestra encima de la barra
-                    estado_spinner["ultima_linea"] = (
-                        f"  {GREEN}[{contador['seq']:>3}] {RESET}{nombre_modelo} - {nombre_visible(linea_strip)}"
+                    # Imprimir fijo primero
+                    clear_line()
+                    sys.stdout.write(
+                        f"  {GREEN}[{contador['seq']:>3}] {nombre_modelo} - {nombre_visible(linea_strip)}{RESET}\n"
                     )
+                    sys.stdout.flush()
+                    # Limpiar ultima_linea — ya está fijo arriba
+                    estado_spinner["ultima_linea"] = ""
     finally:
         try:
             proceso.wait()
@@ -771,14 +775,14 @@ def procesar_lote(lote: list):
     omitidas = len(lote) - len(lote_dedup)
     total = len(lote_dedup)
 
-    print(f"{BOLD}{'═' * 50}{RESET}")
+    print(f"{BOLD}{'═' * 55}{RESET}")
     print(
         f"  Iniciando lote — {total} URL{'s' if total != 1 else ''}"
         + (f" ({omitidas} duplicadas omitidas)" if omitidas else "")
         + f" ({'Windows' if IS_WINDOWS else 'Linux/WSL'})"
     )
     print(f"  {GRAY}{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
-    print(f"{BOLD}{'═' * 50}{RESET}\n")
+    print(f"{BOLD}{'═' * 55}{RESET}\n")
 
     errores_totales = []
     timeouts_totales = []
@@ -826,7 +830,7 @@ def procesar_lote(lote: list):
                     errores_totales.append((res["nombre"], res["errores"]))
 
     # ── Resumen final ──────────────────────────────────────────────────────────
-    print(f"\n{BOLD}{'═' * 50}{RESET}")
+    print(f"\n{BOLD}{'═' * 55}{RESET}")
     print(f"  Lote terminado — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     if errores_totales:
@@ -842,7 +846,7 @@ def procesar_lote(lote: list):
     if not errores_totales and not timeouts_totales:
         print(f"  {GREEN}Todos los hilos sin errores.{RESET}")
 
-    print(f"{BOLD}{'═' * 50}{RESET}\n")
+    print(f"{BOLD}{'═' * 55}{RESET}\n")
 
 
 # =============================================================================
@@ -872,11 +876,16 @@ def main():
     lote = lista[state["batch_index"] : state["batch_index"] + batch_size]
 
     if not lote:
+        print()
         print(f"  {GREEN}[+] Lista completada. Reiniciando índice.{RESET}")
-        guardar_estado(
-            {"batch_index": 0, "hash": obtener_hash_lista(PATHS["lista_file"])}
-        )
-        return
+        print()
+        nuevo_state = {
+            "batch_index": 0,
+            "hash": obtener_hash_lista(PATHS["lista_file"]),
+        }
+        guardar_estado(nuevo_state)
+        lote = lista[:batch_size]
+        state = nuevo_state
 
     procesar_lote(lote)
 

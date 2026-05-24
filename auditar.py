@@ -47,7 +47,6 @@ CFG = cargar_config()
 LOG_DIR = CFG["log_dir"]
 RIPS_DIR = CFG["rips_dir"]
 AUDIT_CSV = CFG["audit_csv"]
-ZIP_FILE = os.path.join(LOG_DIR, f"logs_{datetime.now().strftime('%Y-%m-%d')}.zip")
 
 # =============================================================================
 # ANSI
@@ -59,6 +58,7 @@ RED = "\033[31m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 CYAN = "\033[36m"
+MAGENTA = "\033[35m"
 
 # =============================================================================
 # REGEX
@@ -133,18 +133,23 @@ CSV_HEADER = [
 ]
 
 
-def registrar_en_csv(fila: list):
+def registrar_filas_en_csv(filas: list):
+    """Escribe todas las filas del lote en una sola apertura del CSV."""
+    if not filas:
+        return
     os.makedirs(os.path.dirname(AUDIT_CSV), exist_ok=True)
     for _ in range(5):
         try:
             with open(AUDIT_CSV, "a+", newline="", encoding="utf-8") as f:
                 f.seek(0)
-                if not f.read(4):
-                    # Archivo vacío: escribir sep hint (para Excel) y cabecera
+                es_nuevo = not f.read(4)
+                if es_nuevo:
                     f.write("sep=;\n")
                     csv.writer(f, delimiter=";").writerow(CSV_HEADER)
                 f.seek(0, os.SEEK_END)
-                csv.writer(f, delimiter=";").writerow(fila)
+                w = csv.writer(f, delimiter=";")
+                for fila in filas:
+                    w.writerow(fila)
                 f.flush()
                 os.fsync(f.fileno())
             return
@@ -160,8 +165,9 @@ def registrar_en_csv(fila: list):
 def archivar_logs_en_zip(rutas: list):
     if not rutas:
         return
+    zip_file = os.path.join(LOG_DIR, f"logs_{datetime.now().strftime('%Y-%m-%d')}.zip")
     try:
-        with zipfile.ZipFile(ZIP_FILE, "a", compression=zipfile.ZIP_DEFLATED) as zipf:
+        with zipfile.ZipFile(zip_file, "a", compression=zipfile.ZIP_DEFLATED) as zipf:
             for ruta in rutas:
                 if os.path.exists(ruta):
                     ts = datetime.now().strftime("%H%M%S")
@@ -236,6 +242,7 @@ def analizar_logs():
 
     ahora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     logs_a_comprimir = []
+    filas_csv = []
     conteo = {"ok": 0, "transitorio": 0, "fatal": 0, "sin_resumen": 0}
 
     for archivo in sorted(logs):
@@ -269,24 +276,25 @@ def analizar_logs():
             # ── Clasificar errores desde el cuerpo del log ───────────────────
             # (stdout+stderr de gallery-dl escritos por descarga.py)
             fatales = transitorios = 0
-            for linea in lineas:
-                ls = linea.strip()
-                if not RE_ERR.search(ls):
-                    continue
-                if any(x in ls for x in KEYWORDS_RUIDO):
-                    continue
-                if "[RESUMEN]" in ls:
-                    continue
-                tipo = clasificar_error(ls)
-                if tipo == "FATAL":
-                    fatales += 1
-                else:
-                    transitorios += 1
+            if errores > 0:
+                for linea in lineas:
+                    ls = linea.strip()
+                    if not RE_ERR.search(ls):
+                        continue
+                    if any(x in ls for x in KEYWORDS_RUIDO):
+                        continue
+                    if "[RESUMEN]" in ls:
+                        continue
+                    tipo = clasificar_error(ls)
+                    if tipo == "FATAL":
+                        fatales += 1
+                    else:
+                        transitorios += 1
 
             estado = determinar_estado(rc, fatales, transitorios)
             conteo[estado.lower()] += 1
 
-            registrar_en_csv(
+            filas_csv.append(
                 [
                     ahora_str,
                     nombre,
@@ -305,6 +313,7 @@ def analizar_logs():
             print(f"  {YELLOW}[!] Error procesando {archivo}: {e}{RESET}")
             continue
 
+    registrar_filas_en_csv(filas_csv)
     archivar_logs_en_zip(logs_a_comprimir)
     purgar_zip_antiguos(dias=60)
     imprimir_reporte(conteo, huerfanos, len(logs_a_comprimir))
@@ -318,7 +327,7 @@ def analizar_logs():
 def imprimir_reporte(conteo: dict, huerfanos: list, total_logs: int):
     sep = "\\" if sys.platform == "win32" else "/"
     print(f"\n{BOLD}{'═' * 55}{RESET}")
-    print(f"{BOLD}{CYAN}  REPORTE DE AUDITORÍA{RESET}")
+    print(f"{BOLD}{MAGENTA}  REPORTE DE AUDITORÍA{RESET}")
     print(f"{GRAY}  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
     print(f"{BOLD}{'═' * 55}{RESET}\n")
 
