@@ -5,7 +5,7 @@
       "log_dir": "G:/Rips/logs",
       "lista_file": "C:/gallery-dl/lista.txt",
       "state_file": "C:/gallery-dl/state.json",
-      "audit_csv": "G:/Rips/logs/auditoria_errores.csv"
+      "audit_csv": "G:/Rips/logs/auditoria.csv"
     },
     "gallery_dl": {
       "executable": "gallery-dl.exe",
@@ -18,7 +18,7 @@
       "log_dir": "/home/felipe/Rips/logs",
       "lista_file": "/home/felipe/gallery-dl/lista.txt",
       "state_file": "/home/felipe/gallery-dl/state.json",
-      "audit_csv": "/home/felipe/Rips/logs/auditoria_errores.csv"
+      "audit_csv": "/home/felipe/Rips/logs/auditoria.csv"
     },
     "gallery_dl": {
       "executable": "gallery-dl",
@@ -26,7 +26,6 @@
     }
   },
   "pipeline": {
-    "batch_size": 1,
-    "workers": 1
+    "batch_size": 1
   }
 }

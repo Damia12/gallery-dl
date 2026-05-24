@@ -8,7 +8,6 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -46,7 +45,8 @@ RE_PROGRESS = re.compile(
     re.IGNORECASE,
 )
 
-KEYWORDS_ERROR = ["error", "warning", "failed", "unsupported", "unable", "exception"]
+KEYWORDS_WARNING = ["warning", "rate limit", "sleeping", "skipping"]
+KEYWORDS_ERROR = ["error", "failed", "unsupported", "unable", "exception"]
 KEYWORDS_RUIDO = [
     "theme-light",
     "color-",
@@ -59,7 +59,6 @@ KEYWORDS_RUIDO = [
 TIMEOUT_ACTIVIDAD = 300
 TIMEOUT_SIN_ARCHIVOS = 600
 SLEEP_ENTRE_URLS = 30  # segundos de pausa entre URLs (protección rate-limit)
-MAX_REINTENTOS = 2  # reintentos automáticos si hay errores en modo retry
 
 
 # =============================================================================
@@ -120,6 +119,13 @@ def formatear_tiempo(segundos):
 def nombre_visible(ruta):
     base = os.path.basename(ruta)
     return base.split(" ", 1)[1] if " " in base else base
+
+
+def es_linea_warning(linea):
+    ll = linea.lower()
+    return any(k in ll for k in KEYWORDS_WARNING) and not any(
+        x in linea for x in KEYWORDS_RUIDO
+    )
 
 
 def es_linea_error(linea):
@@ -280,6 +286,7 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
     inicio = time.time()
     archivos_nuevos = []
     errores_hilo = []
+    warnings_hilo = []
     lock_print = threading.Lock()
     contador = {"seq": 0}
 
@@ -316,16 +323,26 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
     def leer_stderr():
         for linea in proceso.stderr:
             linea_strip = ANSI_ESCAPE.sub("", linea).strip()
-            if not linea_strip or not es_linea_error(linea_strip):
+            if not linea_strip:
                 continue
-            errores_hilo.append(linea_strip)
+            es_warn = es_linea_warning(linea_strip)
+            es_err = not es_warn and es_linea_error(linea_strip)
+            if not es_warn and not es_err:
+                continue
             with lock_print:
                 estado_watchdog["ultimo_output"] = time.time()
                 contador["seq"] += 1
                 clear_line()
-                sys.stdout.write(
-                    f"  {RED}[{contador['seq']:>3}] [X] {limpiar_error(linea_strip)}{RESET}\n"
-                )
+                if es_warn:
+                    warnings_hilo.append(linea_strip)
+                    sys.stdout.write(
+                        f"  {YELLOW}[{contador['seq']:>3}] [!] {limpiar_error(linea_strip)}{RESET}\n"
+                    )
+                else:
+                    errores_hilo.append(linea_strip)
+                    sys.stdout.write(
+                        f"  {RED}[{contador['seq']:>3}] [X] {limpiar_error(linea_strip)}{RESET}\n"
+                    )
                 sys.stdout.flush()
 
     spin = threading.Thread(
@@ -392,6 +409,7 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
     return (
         archivos_nuevos,
         errores_hilo,
+        warnings_hilo,
         estado_spinner["nuevo"],
         estado_spinner["done"],
         estado_watchdog["timeout"],
@@ -412,8 +430,10 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
     inicio = time.time()
     archivos_nuevos = []
     errores_hilo = []
+    warnings_hilo = []
     contador_nuevo = 0
     contador_done = 0
+    contador_warnings = 0
     contador_seq = 0
     ultima_ruta = ""
     timeout_ocurrido = False
@@ -551,10 +571,15 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
                         continue
 
                     es_done = "\x1b[2m" in linea_limpia
+                    es_warning = not es_done and es_linea_warning(linea_limpia)
                     es_error = (
-                        es_linea_error(linea_limpia)
-                        or "connection broken" in linea_limpia.lower()
-                        or "incompleteread" in linea_limpia.lower()
+                        not es_done
+                        and not es_warning
+                        and (
+                            es_linea_error(linea_limpia)
+                            or "connection broken" in linea_limpia.lower()
+                            or "incompleteread" in linea_limpia.lower()
+                        )
                     )
                     linea_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
 
@@ -592,6 +617,12 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
                             estado_spinner["done"] = contador_done
                             sys.stdout.write(
                                 f"  {DIM}[{contador_seq:>3}] [DONE] {nombre_visible_str}{RESET}\n"
+                            )
+                        elif es_warning:
+                            contador_warnings += 1
+                            warnings_hilo.append(linea_pura)
+                            sys.stdout.write(
+                                f"  {YELLOW}[{contador_seq:>3}] [!] {limpiar_error(linea_pura)}{RESET}\n"
                             )
                         elif es_error:
                             errores_hilo.append(linea_pura)
@@ -634,6 +665,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
     return (
         archivos_nuevos,
         errores_hilo,
+        warnings_hilo,
         contador_nuevo,
         contador_done,
         timeout_ocurrido,
@@ -651,12 +683,12 @@ def ejecutar_url(url: str, extra_flags=None) -> dict:
     PATHS["log_dir"].mkdir(parents=True, exist_ok=True)
 
     if IS_WINDOWS:
-        archivos, errs, nuevos, done, timeout, duracion, returncode = descargar_windows(
-            url, nombre, extra_flags
+        archivos, errs, warns, nuevos, done, timeout, duracion, returncode = (
+            descargar_windows(url, nombre, extra_flags)
         )
     else:
-        archivos, errs, nuevos, done, timeout, duracion, returncode = descargar_linux(
-            url, nombre, extra_flags
+        archivos, errs, warns, nuevos, done, timeout, duracion, returncode = (
+            descargar_linux(url, nombre, extra_flags)
         )
 
     # Log completo (compatible con auditar.py)
@@ -668,9 +700,11 @@ def ejecutar_url(url: str, extra_flags=None) -> dict:
             f.write("ERRORES:\n" + "\n".join(errs) + "\n")
         else:
             f.write("Sin errores.\n")
+        if warns:
+            f.write("WARNINGS:\n" + "\n".join(warns) + "\n")
         resumen_forense = (
             f'[RESUMEN] nombre_modelo="{nombre}" url="{url}" nuevos="{nuevos}" '
-            f'ya_descargados="{done}" errores="{len(errs)}" '
+            f'ya_descargados="{done}" errores="{len(errs)}" warnings="{len(warns)}" '
             f'duracion="{duracion}" returncode="{returncode}" timeout="{timeout}"\n'
         )
         f.write(resumen_forense)
@@ -682,24 +716,28 @@ def ejecutar_url(url: str, extra_flags=None) -> dict:
         "nuevos": nuevos,
         "done": done,
         "errores": len(errs),
+        "warnings": len(warns),
         "timeout": timeout,
         "duracion": duracion,
         "returncode": returncode,
         "archivos": archivos,
         "errs": errs,
+        "warns": warns,
     }
 
 
 # =============================================================================
 # PROCESADOR DE LOTE
 # =============================================================================
-def _imprimir_resumen_url(res: dict, es_retry: bool = False):
+def _imprimir_resumen_url(res: dict):
     """Imprime la línea de resumen coloreada para una URL procesada."""
     nombre = res["nombre"]
     nuevos = res["nuevos"]
     done = res["done"]
+    warnings = res.get("warnings", 0)
     tiempo_str = formatear_tiempo(res["duracion"])
     resumen = f"{nuevos} nuevos" + (f" | {done} ya descargados" if done > 0 else "")
+    warn_str = f" | {warnings} warning(s)" if warnings > 0 else ""
 
     print()  # separación tras la última línea live del engine
 
@@ -708,57 +746,17 @@ def _imprimir_resumen_url(res: dict, es_retry: bool = False):
             f"  {RED}[T] {nombre} — timeout ({TIMEOUT_ACTIVIDAD}s sin actividad){RESET}"
         )
     elif res["errores"] > 0:
-        tag = f"{YELLOW}[!]{RESET}"
         print(
-            f"  {tag} {nombre} — {resumen} — {res['errores']} error(es) (ver log) — {tiempo_str}"
+            f"  {RED}[X] {nombre} — {resumen}{warn_str} — {res['errores']} error(es) (ver log) — {tiempo_str}{RESET}"
         )
     elif nuevos > 0:
-        print(f"  {GREEN}[+] {nombre} — {resumen} — {tiempo_str}{RESET}")
+        print(f"  {GREEN}[+] {nombre} — {resumen}{warn_str} — {tiempo_str}{RESET}")
+    elif warnings > 0:
+        print(f"  {YELLOW}[!] {nombre} — {resumen}{warn_str} — {tiempo_str}{RESET}")
     elif done > 0:
         print(f"  {GRAY}[OK] {nombre} — todo ya descargado ({done} archivos){RESET}")
     else:
         print(f"  {GRAY}[OK] {nombre} — sin archivos nuevos{RESET}")
-
-
-def _ejecutar_con_reintentos(url: str, extra_flags=None) -> dict:
-    """
-    Ejecuta una URL con reintentos automáticos si hay errores.
-    Solo reintenta cuando MAX_REINTENTOS > 0 y hubo errores (no timeout).
-    Entre reintentos espera SLEEP_ENTRE_URLS segundos (mismo throttle
-    que entre URLs normales para no saturar el servidor).
-    """
-    res = ejecutar_url(url, extra_flags)
-
-    if res["timeout"] or res["errores"] == 0:
-        return res
-
-    for intento in range(1, MAX_REINTENTOS + 1):
-        print(
-            f"\n  {YELLOW}[!] {res['errores']} error(es) — reintento {intento}/{MAX_REINTENTOS} "
-            f"en {SLEEP_ENTRE_URLS}s...{RESET}"
-        )
-        time.sleep(SLEEP_ENTRE_URLS)
-
-        res2 = ejecutar_url(url, extra_flags)
-
-        # Acumular archivos y contadores
-        res["archivos"] += res2["archivos"]
-        res["nuevos"] += res2["nuevos"]
-        res["done"] += res2["done"]
-        res["duracion"] += res2["duracion"]
-
-        if res2["timeout"]:
-            res["timeout"] = True
-            break
-
-        res["errores"] = res2["errores"]
-        res["errs"] = res2["errs"]
-        res["ok"] = res2["ok"]
-
-        if res["errores"] == 0:
-            break
-
-    return res
 
 
 def procesar_lote(lote: list):
@@ -786,48 +784,32 @@ def procesar_lote(lote: list):
 
     errores_totales = []
     timeouts_totales = []
-    workers = PIPELINE.get("workers", 1)
+    totales = {"nuevos": 0, "done": 0, "duracion": 0}
+    warnings_totales = []
 
-    if workers == 1:
-        # ── Modo secuencial: sleep entre URLs + reintentos completos ──────────
-        for i, url in enumerate(lote_dedup, 1):
-            print(
-                f"{BOLD}[{i}/{total}]{RESET} {CYAN}{url.rstrip('/').split('/')[-1][:60]}{RESET}"
-            )
-            print(f"  {GRAY}{url}{RESET}\n")
+    for i, url in enumerate(lote_dedup, 1):
+        print(
+            f"{BOLD}[{i}/{total}]{RESET} {CYAN}{url.rstrip('/').split('/')[-1][:60]}{RESET}"
+        )
+        print(f"  {GRAY}{url}{RESET}\n")
 
-            res = _ejecutar_con_reintentos(url)
-            _imprimir_resumen_url(res)
+        res = ejecutar_url(url)
+        _imprimir_resumen_url(res)
 
-            if res["timeout"]:
-                timeouts_totales.append(res["nombre"])
-            elif res["errores"] > 0:
-                errores_totales.append((res["nombre"], res["errores"]))
+        totales["nuevos"] += res["nuevos"]
+        totales["done"] += res["done"]
+        totales["duracion"] += res["duracion"]
+        if res.get("warnings", 0) > 0:
+            warnings_totales.append((res["nombre"], res["warnings"]))
 
-            # Pausa anti rate-limit entre URLs (no después de la última)
-            if i < total:
-                print(
-                    f"\n  {DIM}Esperando {SLEEP_ENTRE_URLS}s antes de la siguiente URL...{RESET}"
-                )
-                time.sleep(SLEEP_ENTRE_URLS)
-                print()
+        if res["timeout"]:
+            timeouts_totales.append(res["nombre"])
+        elif res["errores"] > 0:
+            errores_totales.append((res["nombre"], res["errores"]))
 
-    else:
-        # ── Modo paralelo: ThreadPoolExecutor (sin sleep entre hilos) ─────────
-        # NOTA: con workers>1 el sleep inter-URL no aplica porque las descargas
-        # corren en paralelo. Si el servidor es sensible a concurrencia, usar workers=1.
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futuros = {
-                pool.submit(_ejecutar_con_reintentos, url): (i, url)
-                for i, url in enumerate(lote_dedup, 1)
-            }
-            for futuro in as_completed(futuros):
-                res = futuro.result()
-                _imprimir_resumen_url(res)
-                if res["timeout"]:
-                    timeouts_totales.append(res["nombre"])
-                elif res["errores"] > 0:
-                    errores_totales.append((res["nombre"], res["errores"]))
+        if i < total:
+            print(f"\n  {DIM}Esperando {SLEEP_ENTRE_URLS}s...{RESET}\n")
+            time.sleep(SLEEP_ENTRE_URLS)
 
     # ── Resumen final ──────────────────────────────────────────────────────────
     print(f"\n{BOLD}{'═' * 55}{RESET}")
@@ -846,6 +828,16 @@ def procesar_lote(lote: list):
     if not errores_totales and not timeouts_totales:
         print(f"  {GREEN}Todos los hilos sin errores.{RESET}")
 
+    if warnings_totales:
+        print(f"\n  {YELLOW}Con warnings:{RESET}")
+        for n, c in warnings_totales:
+            print(f"    {n}: {c} warning(s)")
+
+    print(f"\n  Archivos nuevos     : {BOLD}{totales['nuevos']}{RESET}")
+    print(f"  Ya descargados      : {BOLD}{totales['done']}{RESET}")
+    print(
+        f"  Tiempo total        : {BOLD}{formatear_tiempo(totales['duracion'])}{RESET}"
+    )
     print(f"{BOLD}{'═' * 55}{RESET}\n")
 
 

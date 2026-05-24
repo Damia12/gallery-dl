@@ -82,7 +82,6 @@ FATAL_KEYWORDS = [
     "404 not found",
     "thread deleted",
     "410 gone",
-    "410",
     "invalid thread",
     "unsupported url",
     "unable to extract",
@@ -101,12 +100,16 @@ def clasificar_error(linea: str) -> str:
     return "TRANSITORIO"
 
 
-def determinar_estado(returncode: int, fatales: int, transitorios: int) -> str:
+def determinar_estado(
+    returncode: int, fatales: int, transitorios: int, timeout: bool = False
+) -> str:
     """
     Prioridad: FATAL > TRANSITORIO > OK
     returncode != 0 con errores conocidos se clasifica por tipo.
     returncode != 0 sin errores clasificados → TRANSITORIO (asumir reintentable).
     """
+    if timeout:
+        return "TIMEOUT"
     if fatales > 0 and transitorios == 0:
         return "FATAL"
     if transitorios > 0:
@@ -129,6 +132,7 @@ CSV_HEADER = [
     "Errores",
     "Duracion_s",
     "Returncode",
+    "Timeout",
     "Estado",
 ]
 
@@ -243,7 +247,7 @@ def analizar_logs():
     ahora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     logs_a_comprimir = []
     filas_csv = []
-    conteo = {"ok": 0, "transitorio": 0, "fatal": 0, "sin_resumen": 0}
+    conteo = {"ok": 0, "transitorio": 0, "fatal": 0, "timeout": 0, "sin_resumen": 0}
 
     for archivo in sorted(logs):
         ruta = os.path.join(LOG_DIR, archivo)
@@ -257,7 +261,6 @@ def analizar_logs():
                 m = RE_RESUMEN.search(linea)
                 if m:
                     resumen = dict(RE_KV.findall(m.group(1)))
-                    break
 
             if not resumen:
                 # Log sin [RESUMEN]: proceso interrumpido o log vacío
@@ -272,6 +275,7 @@ def analizar_logs():
             errores = int(resumen.get("errores", 0))
             duracion = int(resumen.get("duracion", 0))
             rc = int(resumen.get("returncode", 0))
+            timeout = resumen.get("timeout", "false").lower() == "true"
 
             # ── Clasificar errores desde el cuerpo del log ───────────────────
             # (stdout+stderr de gallery-dl escritos por descarga.py)
@@ -291,7 +295,7 @@ def analizar_logs():
                     else:
                         transitorios += 1
 
-            estado = determinar_estado(rc, fatales, transitorios)
+            estado = determinar_estado(rc, fatales, transitorios, timeout)
             conteo[estado.lower()] += 1
 
             filas_csv.append(
@@ -304,6 +308,7 @@ def analizar_logs():
                     errores,
                     duracion,
                     rc,
+                    "Sí" if timeout else "No",
                     estado,
                 ]
             )
@@ -334,6 +339,7 @@ def imprimir_reporte(conteo: dict, huerfanos: list, total_logs: int):
     print(f"  Logs procesados     : {BOLD}{total_logs}{RESET}")
     print(f"  OK                  : {BOLD}{GREEN}{conteo['ok']}{RESET}")
     print(f"  Transitorios        : {BOLD}{YELLOW}{conteo['transitorio']}{RESET}")
+    print(f"  Timeout             : {BOLD}{RED}{conteo['timeout']}{RESET}")
     print(f"  Fatales             : {BOLD}{RED}{conteo['fatal']}{RESET}")
 
     if conteo["sin_resumen"]:
