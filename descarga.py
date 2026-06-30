@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -61,17 +62,52 @@ TIMEOUT_SIN_ARCHIVOS = 600
 SLEEP_ENTRE_URLS = 30  # segundos de pausa entre URLs (protección rate-limit)
 
 
+def crear_config_imagenes_temp() -> str:
+    """Crea un archivo de configuración temporal con filtro solo-imágenes"""
+    temp_config = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    )
+
+    config_contenido = {
+        "extractor": {
+            "image-filter": "extension in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'zip', '7z', 'rar')"
+        }
+    }
+
+    json.dump(config_contenido, temp_config, indent=2)
+    temp_config.close()
+
+    return temp_config.name
+
+
 # =============================================================================
 # CONFIGURACIÓN (config.json)
 # =============================================================================
 def cargar_configuracion():
     entorno = "windows" if IS_WINDOWS else "linux"
     ruta_config = Path(__file__).parent / "config.json"
-    with open(ruta_config, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    cfg = data[entorno]
-    paths = {k: Path(v) for k, v in cfg["paths"].items()}
-    return paths, data["pipeline"], cfg["gallery_dl"]
+    if not ruta_config.exists():
+        print(
+            f"\n  {RED}[X] Error crítico: no se encontró config.json en:\n      {ruta_config}{RESET}\n"
+        )
+        sys.exit(1)
+    try:
+        with open(ruta_config, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(
+            f"\n  {RED}[X] Error crítico: config.json tiene formato inválido:\n      {e}{RESET}\n"
+        )
+        sys.exit(1)
+    try:
+        cfg = data[entorno]
+        paths = {k: Path(v) for k, v in cfg["paths"].items()}
+        return paths, data["pipeline"], cfg["gallery_dl"]
+    except KeyError as e:
+        print(
+            f"\n  {RED}[X] Error crítico: clave faltante en config.json: {e}{RESET}\n"
+        )
+        sys.exit(1)
 
 
 PATHS, PIPELINE, GDL_CFG = cargar_configuracion()
@@ -86,18 +122,28 @@ def obtener_hash_lista(lista_path: Path) -> str:
 
 def cargar_estado() -> dict:
     state_file = PATHS["state_file"]
-    lista_hash = obtener_hash_lista(PATHS["lista_file"])
-    default = {"batch_index": 0, "hash": lista_hash}
+    lista = [
+        l.strip()
+        for l in PATHS["lista_file"].read_text(encoding="utf-8").splitlines()
+        if l.strip() and not l.startswith("#")
+    ]
+    lista_len = len(lista)
+    default = {"batch_index": 0}
     if not state_file.exists():
         return default
     with open(state_file, "r", encoding="utf-8") as f:
         state = json.load(f)
-    if state.get("hash") != lista_hash:
+    # Si el índice guardado es mayor que la longitud actual de la lista, reiniciamos (se borraron enlaces)
+    if state.get("batch_index", 0) > lista_len:
+        print(
+            f"\n  {YELLOW}[!] La lista se ha acortado. Reiniciando índice desde 0.{RESET}\n"
+        )
         return default
     return state
 
 
 def guardar_estado(state: dict):
+    # state solo contiene "batch_index", no el hash
     with open(PATHS["state_file"], "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
@@ -140,13 +186,7 @@ def limpiar_error(linea):
 
 
 # =============================================================================
-# SPINNER UNIFICADO — funciona igual en Windows y Linux
-# Estado compartido entre el hilo lector y el hilo del spinner:
-#   nuevo / done    → conteo de archivos (ambos OS)
-#   pct             → porcentaje real      (Linux vía PTY, Windows = -1)
-#   descargado      → bytes descargados    (Linux vía PTY, Windows = "")
-#   total           → tamaño total         (Linux vía PTY, Windows = "")
-#   speed           → velocidad            (Linux vía PTY, Windows = "")
+# SPINNER UNIFICADO
 # =============================================================================
 def spinner_thread(estado, lock_print):
     """Hilo de spinner unificado. Muestra la última línea de actividad
@@ -308,114 +348,116 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
         "timeout": False,
     }
 
-    sys.stdout.write("\033[?25l")
-    sys.stdout.flush()
-
-    proceso = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-
-    def leer_stderr():
-        for linea in proceso.stderr:
-            linea_strip = ANSI_ESCAPE.sub("", linea).strip()
-            if not linea_strip:
-                continue
-            es_warn = es_linea_warning(linea_strip)
-            es_err = not es_warn and es_linea_error(linea_strip)
-            if not es_warn and not es_err:
-                continue
-            with lock_print:
-                estado_watchdog["ultimo_output"] = time.time()
-                contador["seq"] += 1
-                clear_line()
-                if es_warn:
-                    warnings_hilo.append(linea_strip)
-                    sys.stdout.write(
-                        f"  {YELLOW}[{contador['seq']:>3}] [!] {limpiar_error(linea_strip)}{RESET}\n"
-                    )
-                else:
-                    errores_hilo.append(linea_strip)
-                    sys.stdout.write(
-                        f"  {RED}[{contador['seq']:>3}] [X] {limpiar_error(linea_strip)}{RESET}\n"
-                    )
-                sys.stdout.flush()
-
-    spin = threading.Thread(
-        target=spinner_thread, args=(estado_spinner, lock_print), daemon=True
-    )
-    watch = threading.Thread(
-        target=watchdog_thread,
-        args=(proceso, estado_watchdog, TIMEOUT_ACTIVIDAD),
-        daemon=True,
-    )
-    stderr_thr = threading.Thread(target=leer_stderr, daemon=True)
-
-    spin.start()
-    watch.start()
-    stderr_thr.start()
-
+    # <<< CAMBIO: try externo que garantiza restauración del cursor
     try:
-        for linea in proceso.stdout:
-            linea_strip = linea.strip()
-            if not linea_strip:
-                continue
-
-            with lock_print:
-                estado_watchdog["ultimo_output"] = time.time()
-                estado_watchdog["ultimo_archivo"] = time.time()
-                contador["seq"] += 1
-
-                if linea_strip.startswith("#"):
-                    estado_spinner["done"] += 1
-                    ruta = linea_strip[1:].strip()
-                    # Imprimir DONE como línea fija y limpiar ultima_linea
-                    clear_line()
-                    sys.stdout.write(
-                        f"  {GRAY}[{contador['seq']:>3}] [DONE] {nombre_modelo} - {nombre_visible(ruta)}{RESET}\n"
-                    )
-                    sys.stdout.flush()
-                    estado_spinner["ultima_linea"] = ""
-                else:
-                    estado_spinner["nuevo"] += 1
-                    archivos_nuevos.append(linea_strip)
-                    # Imprimir fijo primero
-                    clear_line()
-                    sys.stdout.write(
-                        f"  {GREEN}[{contador['seq']:>3}] {nombre_modelo} - {nombre_visible(linea_strip)}{RESET}\n"
-                    )
-                    sys.stdout.flush()
-                    # Limpiar ultima_linea — ya está fijo arriba
-                    estado_spinner["ultima_linea"] = ""
-    finally:
-        try:
-            proceso.wait()
-        except OSError:
-            pass
-        stderr_thr.join(timeout=5)
-        estado_spinner["stop"] = True
-        estado_watchdog["stop"] = True
-        spin.join(timeout=2)
-        watch.join(timeout=2)
-        sys.stdout.write("\033[?25h")
+        sys.stdout.write("\033[?25l")
         sys.stdout.flush()
 
-    returncode = proceso.returncode if proceso.returncode is not None else -1
+        proceso = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
 
-    return (
-        archivos_nuevos,
-        errores_hilo,
-        warnings_hilo,
-        estado_spinner["nuevo"],
-        estado_spinner["done"],
-        estado_watchdog["timeout"],
-        int(time.time() - inicio),
-        returncode,
-    )
+        def leer_stderr():
+            for linea in proceso.stderr:
+                linea_strip = ANSI_ESCAPE.sub("", linea).strip()
+                if not linea_strip:
+                    continue
+                es_warn = es_linea_warning(linea_strip)
+                es_err = not es_warn and es_linea_error(linea_strip)
+                if not es_warn and not es_err:
+                    continue
+                with lock_print:
+                    estado_watchdog["ultimo_output"] = time.time()
+                    contador["seq"] += 1
+                    clear_line()
+                    if es_warn:
+                        warnings_hilo.append(linea_strip)
+                        sys.stdout.write(
+                            f"  {YELLOW}[{contador['seq']:>3}] [!] {limpiar_error(linea_strip)}{RESET}\n"
+                        )
+                    else:
+                        errores_hilo.append(linea_strip)
+                        sys.stdout.write(
+                            f"  {RED}[{contador['seq']:>3}] [X] {limpiar_error(linea_strip)}{RESET}\n"
+                        )
+                    sys.stdout.flush()
+
+        spin = threading.Thread(
+            target=spinner_thread, args=(estado_spinner, lock_print), daemon=True
+        )
+        watch = threading.Thread(
+            target=watchdog_thread,
+            args=(proceso, estado_watchdog, TIMEOUT_ACTIVIDAD),
+            daemon=True,
+        )
+        stderr_thr = threading.Thread(target=leer_stderr, daemon=True)
+
+        spin.start()
+        watch.start()
+        stderr_thr.start()
+
+        try:
+            for linea in proceso.stdout:
+                linea_strip = linea.strip()
+                if not linea_strip:
+                    continue
+
+                with lock_print:
+                    estado_watchdog["ultimo_output"] = time.time()
+                    estado_watchdog["ultimo_archivo"] = time.time()
+                    contador["seq"] += 1
+
+                    if linea_strip.startswith("#"):
+                        estado_spinner["done"] += 1
+                        ruta = linea_strip[1:].strip()
+                        clear_line()
+                        sys.stdout.write(
+                            f"  {GRAY}[{contador['seq']:>3}] [DONE] {nombre_modelo} - {nombre_visible(ruta)}{RESET}\n"
+                        )
+                        sys.stdout.flush()
+                        estado_spinner["ultima_linea"] = ""
+                    else:
+                        estado_spinner["nuevo"] += 1
+                        archivos_nuevos.append(linea_strip)
+                        clear_line()
+                        sys.stdout.write(
+                            f"  {GREEN}[{contador['seq']:>3}] {nombre_modelo} - {nombre_visible(linea_strip)}{RESET}\n"
+                        )
+                        sys.stdout.flush()
+                        estado_spinner["ultima_linea"] = ""
+        finally:
+            try:
+                proceso.wait()
+            except OSError:
+                pass
+            stderr_thr.join(timeout=5)
+            estado_spinner["stop"] = True
+            estado_watchdog["stop"] = True
+            spin.join(timeout=2)
+            watch.join(timeout=2)
+            # <<< ELIMINADO: la restauración del cursor se hará en el finally externo
+
+        returncode = proceso.returncode if proceso.returncode is not None else -1
+
+        return (
+            archivos_nuevos,
+            errores_hilo,
+            warnings_hilo,
+            estado_spinner["nuevo"],
+            estado_spinner["done"],
+            estado_watchdog["timeout"],
+            int(time.time() - inicio),
+            returncode,
+        )
+    finally:
+        # <<< CAMBIO: restauración garantizada del cursor
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
 
 
 # =============================================================================
@@ -442,7 +484,6 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
     env_vars = os.environ.copy()
     env_vars["PYTHONUNBUFFERED"] = "1"
 
-    # Estado compartido con el hilo del spinner
     lock_print = threading.Lock()
     estado_spinner = {
         "stop": False,
@@ -456,228 +497,242 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
         "ultima_linea": "",
     }
 
-    sys.stdout.write("\033[?25l")
-    sys.stdout.flush()
-
-    spin = threading.Thread(
-        target=spinner_thread, args=(estado_spinner, lock_print), daemon=True
-    )
-    spin.start()
-
-    master_fd = None
-    proceso = None
-    buffer = ""
-    ultimo_output = time.time()
-
+    # <<< CAMBIO: try externo que garantiza restauración del cursor
     try:
-        master_fd, slave_fd = pty.openpty()
-        proceso = subprocess.Popen(
-            cmd, stdout=slave_fd, stderr=slave_fd, close_fds=True, env=env_vars
+        sys.stdout.write("\033[?25l")
+        sys.stdout.flush()
+
+        spin = threading.Thread(
+            target=spinner_thread, args=(estado_spinner, lock_print), daemon=True
         )
-        os.close(slave_fd)
+        spin.start()
 
-        while True:
-            r, _, _ = select.select([master_fd], [], [], 1.0)
+        master_fd = None
+        proceso = None
+        buffer = ""
+        ultimo_output = time.time()
 
-            if not r:
-                ahora = time.time()
-                if ahora - ultimo_output > TIMEOUT_ACTIVIDAD:
-                    try:
-                        proceso.kill()
-                    except OSError:
-                        pass
-                    timeout_ocurrido = True
-                    break
-                if ahora - ultimo_archivo > TIMEOUT_SIN_ARCHIVOS:
-                    try:
-                        proceso.kill()
-                    except OSError:
-                        pass
-                    timeout_ocurrido = True
-                    break
-                continue
-
-            try:
-                chunk = os.read(master_fd, 4096).decode("utf-8", "replace")
-            except OSError as e:
-                if e.errno == errno.EIO:
-                    break
-                raise
-
-            if not chunk:
-                break
-
-            ultimo_output = time.time()
-            buffer += chunk
-            buffer = buffer.replace("\r\n", "\n")
+        try:
+            master_fd, slave_fd = pty.openpty()
+            proceso = subprocess.Popen(
+                cmd, stdout=slave_fd, stderr=slave_fd, close_fds=True, env=env_vars
+            )
+            os.close(slave_fd)
 
             while True:
-                idx_n = buffer.find("\n")
-                idx_r = buffer.find("\r")
+                r, _, _ = select.select([master_fd], [], [], 1.0)
 
-                if idx_n == -1 and idx_r == -1:
+                if not r:
+                    ahora = time.time()
+                    if ahora - ultimo_output > TIMEOUT_ACTIVIDAD:
+                        try:
+                            proceso.kill()
+                        except OSError:
+                            pass
+                        timeout_ocurrido = True
+                        break
+                    if ahora - ultimo_archivo > TIMEOUT_SIN_ARCHIVOS:
+                        try:
+                            proceso.kill()
+                        except OSError:
+                            pass
+                        timeout_ocurrido = True
+                        break
+                    continue
+
+                try:
+                    chunk = os.read(master_fd, 4096).decode("utf-8", "replace")
+                except OSError as e:
+                    if e.errno == errno.EIO:
+                        break
+                    raise
+
+                if not chunk:
                     break
 
-                es_linea_complete = False
-                linea = ""
+                ultimo_output = time.time()
+                buffer += chunk
+                buffer = buffer.replace("\r\n", "\n")
 
-                if idx_n != -1 and (idx_r == -1 or idx_n < idx_r):
-                    linea = buffer[:idx_n]
-                    buffer = buffer[idx_n + 1 :]
-                    es_linea_complete = True
+                while True:
+                    idx_n = buffer.find("\n")
+                    idx_r = buffer.find("\r")
 
-                elif idx_r != -1:
-                    texto_antes = buffer[:idx_r]
+                    if idx_n == -1 and idx_r == -1:
+                        break
 
-                    if texto_antes.strip() and not re.search(r"\d+%", texto_antes):
-                        linea = texto_antes
-                        buffer = buffer[idx_r + 1 :]
+                    es_linea_complete = False
+                    linea = ""
+
+                    if idx_n != -1 and (idx_r == -1 or idx_n < idx_r):
+                        linea = buffer[:idx_n]
+                        buffer = buffer[idx_n + 1 :]
                         es_linea_complete = True
-                    else:
-                        if idx_r == len(buffer) - 1:
-                            break
-                        buffer = buffer[idx_r + 1 :]
-                        prog_limpio = ANSI_ESCAPE.sub("", texto_antes).strip()
-                        if prog_limpio and "%" in prog_limpio:
-                            # Parsear y actualizar estado compartido con el spinner
-                            datos = parsear_progreso(prog_limpio)
+
+                    elif idx_r != -1:
+                        texto_antes = buffer[:idx_r]
+
+                        if texto_antes.strip() and not re.search(r"\d+%", texto_antes):
+                            linea = texto_antes
+                            buffer = buffer[idx_r + 1 :]
+                            es_linea_complete = True
+                        else:
+                            if idx_r == len(buffer) - 1:
+                                break
+                            buffer = buffer[idx_r + 1 :]
+                            prog_limpio = ANSI_ESCAPE.sub("", texto_antes).strip()
+                            if prog_limpio and "%" in prog_limpio:
+                                datos = parsear_progreso(prog_limpio)
+                                if datos:
+                                    estado_spinner["pct"] = datos["pct"]
+                                    estado_spinner["descargado"] = datos["descargado"]
+                                    estado_spinner["total"] = datos["total"]
+                                    estado_spinner["speed"] = datos["speed"]
+                            continue
+
+                    if es_linea_complete:
+                        linea_limpia = linea.strip()
+                        if not linea_limpia:
+                            continue
+
+                        linea_pura_check = ANSI_ESCAPE.sub("", linea_limpia).lower()
+                        if any(k in linea_pura_check for k in KEYWORDS_RUIDO):
+                            continue
+
+                        if "%" in linea_limpia and any(
+                            x in linea_limpia
+                            for x in ["MB", "KB", "B/s", "MiB", "KiB", "GiB"]
+                        ):
+                            prog_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
+                            datos = parsear_progreso(prog_pura)
                             if datos:
                                 estado_spinner["pct"] = datos["pct"]
                                 estado_spinner["descargado"] = datos["descargado"]
                                 estado_spinner["total"] = datos["total"]
                                 estado_spinner["speed"] = datos["speed"]
-                        continue
+                            continue
 
-                if es_linea_complete:
-                    linea_limpia = linea.strip()
-                    if not linea_limpia:
-                        continue
-
-                    linea_pura_check = ANSI_ESCAPE.sub("", linea_limpia).lower()
-                    if any(k in linea_pura_check for k in KEYWORDS_RUIDO):
-                        continue
-
-                    if "%" in linea_limpia and any(
-                        x in linea_limpia
-                        for x in ["MB", "KB", "B/s", "MiB", "KiB", "GiB"]
-                    ):
-                        prog_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
-                        datos = parsear_progreso(prog_pura)
-                        if datos:
-                            estado_spinner["pct"] = datos["pct"]
-                            estado_spinner["descargado"] = datos["descargado"]
-                            estado_spinner["total"] = datos["total"]
-                            estado_spinner["speed"] = datos["speed"]
-                        continue
-
-                    es_done = "\x1b[2m" in linea_limpia
-                    es_warning = not es_done and es_linea_warning(linea_limpia)
-                    es_error = (
-                        not es_done
-                        and not es_warning
-                        and (
-                            es_linea_error(linea_limpia)
-                            or "connection broken" in linea_limpia.lower()
-                            or "incompleteread" in linea_limpia.lower()
+                        es_done = "\x1b[2m" in linea_limpia
+                        es_warning = not es_done and es_linea_warning(linea_limpia)
+                        es_error = (
+                            not es_done
+                            and not es_warning
+                            and (
+                                es_linea_error(linea_limpia)
+                                or "connection broken" in linea_limpia.lower()
+                                or "incompleteread" in linea_limpia.lower()
+                            )
                         )
-                    )
-                    linea_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
+                        linea_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
 
-                    if not linea_pura or linea_pura == ultima_ruta:
-                        continue
-                    ultima_ruta = linea_pura
+                        if not linea_pura or linea_pura == ultima_ruta:
+                            continue
+                        ultima_ruta = linea_pura
 
-                    nombre_sin_prefijo = (
-                        RE_PREFIJO_NUM.sub("", linea_pura)
-                        if RE_PREFIJO_NUM.match(linea_pura)
-                        else linea_pura
-                    )
-                    carpeta_visible = os.path.basename(
-                        os.path.dirname(nombre_sin_prefijo)
-                    )
-                    archivo_visible = os.path.basename(nombre_sin_prefijo)
-                    nombre_visible_str = (
-                        f"{carpeta_visible} {archivo_visible}"
-                        if carpeta_visible
-                        else archivo_visible
-                    )
-                    contador_seq += 1
+                        nombre_sin_prefijo = (
+                            RE_PREFIJO_NUM.sub("", linea_pura)
+                            if RE_PREFIJO_NUM.match(linea_pura)
+                            else linea_pura
+                        )
+                        carpeta_visible = os.path.basename(
+                            os.path.dirname(nombre_sin_prefijo)
+                        )
+                        archivo_visible = os.path.basename(nombre_sin_prefijo)
+                        nombre_visible_str = (
+                            f"{carpeta_visible} {archivo_visible}"
+                            if carpeta_visible
+                            else archivo_visible
+                        )
+                        contador_seq += 1
 
-                    with lock_print:
-                        estado_spinner["pct"] = -1
-                        estado_spinner["descargado"] = ""
-                        estado_spinner["total"] = ""
-                        estado_spinner["speed"] = ""
-                        estado_spinner["ultima_linea"] = ""
+                        with lock_print:
+                            estado_spinner["pct"] = -1
+                            estado_spinner["descargado"] = ""
+                            estado_spinner["total"] = ""
+                            estado_spinner["speed"] = ""
+                            estado_spinner["ultima_linea"] = ""
 
-                        clear_line()
-                        if es_done:
-                            contador_done += 1
-                            ultimo_archivo = time.time()
-                            estado_spinner["done"] = contador_done
-                            sys.stdout.write(
-                                f"  {DIM}[{contador_seq:>3}] [DONE] {nombre_visible_str}{RESET}\n"
-                            )
-                        elif es_warning:
-                            contador_warnings += 1
-                            warnings_hilo.append(linea_pura)
-                            sys.stdout.write(
-                                f"  {YELLOW}[{contador_seq:>3}] [!] {limpiar_error(linea_pura)}{RESET}\n"
-                            )
-                        elif es_error:
-                            errores_hilo.append(linea_pura)
-                            sys.stdout.write(
-                                f"  {RED}[{contador_seq:>3}] [X] {limpiar_error(linea_pura)}{RESET}\n"
-                            )
-                        else:
-                            contador_nuevo += 1
-                            ultimo_archivo = time.time()
-                            archivos_nuevos.append(linea_pura)
-                            estado_spinner["nuevo"] = contador_nuevo
-                            sys.stdout.write(
-                                f"  {GREEN}[{contador_seq:>3}] {nombre_visible_str}{RESET}\n"
-                            )
-                        sys.stdout.flush()
+                            clear_line()
+                            if es_done:
+                                contador_done += 1
+                                ultimo_archivo = time.time()
+                                estado_spinner["done"] = contador_done
+                                sys.stdout.write(
+                                    f"  {DIM}[{contador_seq:>3}] [DONE] {nombre_visible_str}{RESET}\n"
+                                )
+                            elif es_warning:
+                                contador_warnings += 1
+                                warnings_hilo.append(linea_pura)
+                                sys.stdout.write(
+                                    f"  {YELLOW}[{contador_seq:>3}] [!] {limpiar_error(linea_pura)}{RESET}\n"
+                                )
+                            elif es_error:
+                                errores_hilo.append(linea_pura)
+                                sys.stdout.write(
+                                    f"  {RED}[{contador_seq:>3}] [X] {limpiar_error(linea_pura)}{RESET}\n"
+                                )
+                            else:
+                                contador_nuevo += 1
+                                ultimo_archivo = time.time()
+                                archivos_nuevos.append(linea_pura)
+                                estado_spinner["nuevo"] = contador_nuevo
+                                sys.stdout.write(
+                                    f"  {GREEN}[{contador_seq:>3}] {nombre_visible_str}{RESET}\n"
+                                )
+                            sys.stdout.flush()
 
+        finally:
+            if proceso is not None:
+                try:
+                    proceso.wait()
+                except OSError:
+                    pass
+            estado_spinner["stop"] = True
+            spin.join(timeout=2)
+            clear_line()
+            # <<< ELIMINADO: restauración del cursor aquí (se hará en el finally externo)
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+
+        returncode = (
+            proceso.returncode
+            if proceso is not None and proceso.returncode is not None
+            else -1
+        )
+
+        return (
+            archivos_nuevos,
+            errores_hilo,
+            warnings_hilo,
+            contador_nuevo,
+            contador_done,
+            timeout_ocurrido,
+            int(time.time() - inicio),
+            returncode,
+        )
     finally:
-        if proceso is not None:
-            try:
-                proceso.wait()
-            except OSError:
-                pass
-        estado_spinner["stop"] = True
-        spin.join(timeout=2)
-        clear_line()
+        # <<< CAMBIO: restauración garantizada del cursor
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
-        if master_fd is not None:
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
-
-    returncode = (
-        proceso.returncode
-        if proceso is not None and proceso.returncode is not None
-        else -1
-    )
-
-    return (
-        archivos_nuevos,
-        errores_hilo,
-        warnings_hilo,
-        contador_nuevo,
-        contador_done,
-        timeout_ocurrido,
-        int(time.time() - inicio),
-        returncode,
-    )
 
 
 # =============================================================================
 # CAPA DE EJECUCIÓN: despacha al engine correcto
 # =============================================================================
-def ejecutar_url(url: str, extra_flags=None) -> dict:
+def ejecutar_url(url: str) -> dict:
+    extra_flags = []
+    temp_config_file = None
+
+    # Detectar ?images para descargar solo imágenes
+    if url.endswith("?images"):
+        temp_config_file = crear_config_imagenes_temp()
+        extra_flags.extend(["-c", temp_config_file])
+        url = url.replace("?images", "").strip()
+        print(f"  {CYAN}[!] Modo solo-imágenes activado para esta URL{RESET}")
+
     nombre = url.rstrip("/").split("/")[-1][:60]
     log_path = PATHS["log_dir"] / f"{nombre}.log"
     PATHS["log_dir"].mkdir(parents=True, exist_ok=True)
@@ -690,6 +745,13 @@ def ejecutar_url(url: str, extra_flags=None) -> dict:
         archivos, errs, warns, nuevos, done, timeout, duracion, returncode = (
             descargar_linux(url, nombre, extra_flags)
         )
+
+    # Limpiar archivo temporal si se creó
+    if temp_config_file and os.path.exists(temp_config_file):
+        try:
+            os.unlink(temp_config_file)
+        except OSError:
+            pass
 
     # Log completo (compatible con auditar.py)
     with open(log_path, "a", encoding="utf-8") as f:
@@ -847,53 +909,59 @@ def procesar_lote(lote: list):
 def main():
     import shutil
 
-    # Validar que gallery-dl esté disponible
-    if not shutil.which(GDL_CFG["executable"]):
-        print(
-            f"\n  {RED}[X] Error crítico: '{GDL_CFG['executable']}' no encontrado en PATH.{RESET}"
-        )
-        print("      Instala gallery-dl y asegúrate de que esté en el PATH.\n")
+    try:
+        # Validar que gallery-dl esté disponible
+        if not shutil.which(GDL_CFG["executable"]):
+            print(
+                f"\n  {RED}[X] Error crítico: '{GDL_CFG['executable']}' no encontrado en PATH.{RESET}"
+            )
+            print("      Instala gallery-dl y asegúrate de que esté en el PATH.\n")
+            if IS_WINDOWS:
+                input(f"  {GRAY}Presiona Enter para salir...{RESET}")
+            sys.exit(1)
+
+        state = cargar_estado()
+        lista = [
+            l.strip()
+            for l in PATHS["lista_file"].read_text(encoding="utf-8").splitlines()
+            if l.strip() and not l.startswith("#")
+        ]
+
+        batch_size = PIPELINE["batch_size"]
+        lote = lista[state["batch_index"] : state["batch_index"] + batch_size]
+
+        if not lote:
+            print()
+            print(f"  {GREEN}[+] Lista completada. Reiniciando índice.{RESET}")
+            print()
+            nuevo_state = {
+                "batch_index": 0,
+            }
+            guardar_estado(nuevo_state)
+            lote = lista[:batch_size]
+            state = nuevo_state
+
+        procesar_lote(lote)
+
+        state["batch_index"] += len(lote)
+        guardar_estado(state)
+
+        # Auditoría automática
+        auditar_py = Path(__file__).parent / "auditar.py"
+        if auditar_py.exists():
+            print(f"  {CYAN}Ejecutando auditoría...{RESET}\n")
+            subprocess.run([sys.executable, str(auditar_py)])
+        else:
+            print(f"  {DIM}(auditar.py no encontrado, se omite){RESET}")
+
         if IS_WINDOWS:
-            input(f"  {GRAY}Presiona Enter para salir...{RESET}")
-        sys.exit(1)
+            input(f"\n  {GRAY}Presiona Enter para salir...{RESET}")
 
-    state = cargar_estado()
-    lista = [
-        l.strip()
-        for l in PATHS["lista_file"].read_text(encoding="utf-8").splitlines()
-        if l.strip() and not l.startswith("#")
-    ]
-
-    batch_size = PIPELINE["batch_size"]
-    lote = lista[state["batch_index"] : state["batch_index"] + batch_size]
-
-    if not lote:
-        print()
-        print(f"  {GREEN}[+] Lista completada. Reiniciando índice.{RESET}")
-        print()
-        nuevo_state = {
-            "batch_index": 0,
-            "hash": obtener_hash_lista(PATHS["lista_file"]),
-        }
-        guardar_estado(nuevo_state)
-        lote = lista[:batch_size]
-        state = nuevo_state
-
-    procesar_lote(lote)
-
-    state["batch_index"] += len(lote)
-    guardar_estado(state)
-
-    # Auditoría automática (igual que en V2)
-    auditar_py = Path(__file__).parent / "auditar.py"
-    if auditar_py.exists():
-        print(f"  {CYAN}Ejecutando auditoría...{RESET}\n")
-        subprocess.run([sys.executable, str(auditar_py)])
-    else:
-        print(f"  {DIM}(auditar.py no encontrado, se omite){RESET}")
-
-    if IS_WINDOWS:
-        input(f"\n  {GRAY}Presiona Enter para salir...{RESET}")
+    except KeyboardInterrupt:
+        print(f"\n\n  {YELLOW}[!] Interrupción por usuario.{RESET}")
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+        sys.exit(130)
 
 
 if __name__ == "__main__":

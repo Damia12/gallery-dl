@@ -13,6 +13,18 @@ import time
 import zipfile
 from datetime import datetime
 
+# =============================================================================
+# ANSI
+# =============================================================================
+RESET = "\033[0m"
+BOLD = "\033[1m"
+GRAY = "\033[90m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+MAGENTA = "\033[35m"
+
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -26,7 +38,7 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
 def cargar_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
-        print(f"[X] No se encontró config.json en: {CONFIG_PATH}")
+        print(f"[X]  {RED}No se encontró config.json en: {CONFIG_PATH}{RESET}")
         sys.exit(1)
     with open(CONFIG_PATH, encoding="utf-8") as f:
         raw = json.load(f)
@@ -49,18 +61,6 @@ RIPS_DIR = CFG["rips_dir"]
 AUDIT_CSV = CFG["audit_csv"]
 
 # =============================================================================
-# ANSI
-# =============================================================================
-RESET = "\033[0m"
-BOLD = "\033[1m"
-GRAY = "\033[90m"
-RED = "\033[31m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-CYAN = "\033[36m"
-MAGENTA = "\033[35m"
-
-# =============================================================================
 # REGEX
 # =============================================================================
 
@@ -76,16 +76,24 @@ RE_ERR = re.compile(
     re.IGNORECASE,
 )
 
-KEYWORDS_RUIDO = ["theme-light", "color-", "--rem", "None_", "logging"]
+KEYWORDS_RUIDO = [
+    "theme-light",
+    "color-",
+    "--rem",
+    "None_",
+    "logging",
+    "extracted",
+    "cookies from",
+]
 
-FATAL_KEYWORDS = [
-    "404 not found",
-    "thread deleted",
-    "410 gone",
-    "invalid thread",
-    "unsupported url",
-    "unable to extract",
-    "failed to parse",
+FATAL_PATTERNS = [
+    re.compile(r"404", re.IGNORECASE),
+    re.compile(r"410", re.IGNORECASE),
+    re.compile(r"thread.*deleted", re.IGNORECASE),
+    re.compile(r"invalid.*thread", re.IGNORECASE),
+    re.compile(r"unsupported.*url", re.IGNORECASE),
+    re.compile(r"unable to extract", re.IGNORECASE),
+    re.compile(r"failed to parse", re.IGNORECASE),
 ]
 
 # =============================================================================
@@ -94,9 +102,9 @@ FATAL_KEYWORDS = [
 
 
 def clasificar_error(linea: str) -> str:
-    ll = linea.lower()
-    if any(k in ll for k in FATAL_KEYWORDS):
-        return "FATAL"
+    for pattern in FATAL_PATTERNS:
+        if pattern.search(linea):
+            return "FATAL"
     return "TRANSITORIO"
 
 
@@ -110,7 +118,7 @@ def determinar_estado(
     """
     if timeout:
         return "TIMEOUT"
-    if fatales > 0 and transitorios == 0:
+    if fatales > 0:
         return "FATAL"
     if transitorios > 0:
         return "TRANSITORIO"
@@ -249,7 +257,9 @@ def analizar_logs():
     filas_csv = []
     conteo = {"ok": 0, "transitorio": 0, "fatal": 0, "timeout": 0, "sin_resumen": 0}
 
-    for archivo in sorted(logs):
+    for archivo in sorted(
+        logs, key=lambda f: os.path.getmtime(os.path.join(LOG_DIR, f))
+    ):
         ruta = os.path.join(LOG_DIR, archivo)
         try:
             with open(ruta, "r", encoding="utf-8", errors="replace") as f:
