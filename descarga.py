@@ -57,9 +57,9 @@ KEYWORDS_RUIDO = [
     "cookies from",
 ]
 
-TIMEOUT_ACTIVIDAD = 300
-TIMEOUT_SIN_ARCHIVOS = 600
-SLEEP_ENTRE_URLS = 30  # segundos de pausa entre URLs (protección rate-limit)
+TIMEOUT_ACTIVIDAD = 900
+TIMEOUT_SIN_ARCHIVOS = 1800
+SLEEP_ENTRE_URLS = 10  # segundos de pausa entre URLs (protección rate-limit)
 
 
 def crear_config_imagenes_temp() -> str:

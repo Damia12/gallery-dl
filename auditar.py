@@ -109,15 +109,24 @@ def clasificar_error(linea: str) -> str:
 
 
 def determinar_estado(
-    returncode: int, fatales: int, transitorios: int, timeout: bool = False
+    returncode: int,
+    fatales: int,
+    transitorios: int,
+    timeout: bool = False,
+    nuevos: int = 0,
+    errores: int = 0,
 ) -> str:
     """
-    Prioridad: FATAL > TRANSITORIO > OK
-    returncode != 0 con errores conocidos se clasifica por tipo.
-    returncode != 0 sin errores clasificados → TRANSITORIO (asumir reintentable).
+    Evolución v2.0: Clasificación inteligente de estados.
+    Prioridad: TIMEOUT (Diferenciado) > FATAL > TRANSITORIO > OK
     """
     if timeout:
-        return "TIMEOUT"
+        # Si hubo progreso real y la tasa de error es baja (< 20% del contenido nuevo)
+        if nuevos > 0 and errores < (nuevos * 0.20):
+            return "TIMEOUT_SANANDO"  # Hilo masivo en progreso saludable
+        else:
+            return "TIMEOUT_ATASCADO"  # Atascado por hosts caídos (ej. TurboCDN)
+
     if fatales > 0:
         return "FATAL"
     if transitorios > 0:
@@ -255,8 +264,16 @@ def analizar_logs():
     ahora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     logs_a_comprimir = []
     filas_csv = []
-    conteo = {"ok": 0, "transitorio": 0, "fatal": 0, "timeout": 0, "sin_resumen": 0}
 
+    conteo = {
+        "ok": 0,
+        "transitorio": 0,
+        "fatal": 0,
+        "timeout_sanando": 0,
+        "timeout_atascado": 0,
+        "timeout": 0,
+        "sin_resumen": 0,
+    }
     for archivo in sorted(
         logs, key=lambda f: os.path.getmtime(os.path.join(LOG_DIR, f))
     ):
@@ -305,7 +322,9 @@ def analizar_logs():
                     else:
                         transitorios += 1
 
-            estado = determinar_estado(rc, fatales, transitorios, timeout)
+            estado = determinar_estado(
+                rc, fatales, transitorios, timeout, nuevos, errores
+            )
             conteo[estado.lower()] += 1
 
             filas_csv.append(
@@ -349,7 +368,12 @@ def imprimir_reporte(conteo: dict, huerfanos: list, total_logs: int):
     print(f"  Logs procesados     : {BOLD}{total_logs}{RESET}")
     print(f"  OK                  : {BOLD}{GREEN}{conteo['ok']}{RESET}")
     print(f"  Transitorios        : {BOLD}{YELLOW}{conteo['transitorio']}{RESET}")
-    print(f"  Timeout             : {BOLD}{RED}{conteo['timeout']}{RESET}")
+    print(
+        f"  Timeout Sanando     : {BOLD}{CYAN}{conteo.get('timeout_sanando', 0)}{RESET} {GRAY}(Hilo gigante estable){RESET}"
+    )
+    print(
+        f"  Timeout Atascado    : {BOLD}{RED}{conteo.get('timeout_atascado', 0)}{RESET} {GRAY}(Host caído/Atascado){RESET}"
+    )
     print(f"  Fatales             : {BOLD}{RED}{conteo['fatal']}{RESET}")
 
     if conteo["sin_resumen"]:
