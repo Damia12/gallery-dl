@@ -6,7 +6,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime
@@ -59,54 +58,32 @@ KEYWORDS_RUIDO = [
 
 TIMEOUT_ACTIVIDAD = 900
 TIMEOUT_SIN_ARCHIVOS = 1800
-SLEEP_ENTRE_URLS = 10  # segundos de pausa entre URLs (protección rate-limit)
-
-
-def crear_config_imagenes_temp() -> str:
-    """Crea un archivo de configuración temporal con filtro solo-imágenes"""
-    temp_config = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False, encoding="utf-8"
-    )
-
-    config_contenido = {
-        "extractor": {
-            "image-filter": "extension in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'zip', '7z', 'rar')"
-        }
-    }
-
-    json.dump(config_contenido, temp_config, indent=2)
-    temp_config.close()
-
-    return temp_config.name
+SLEEP_ENTRE_URLS = 10
 
 
 # =============================================================================
-# CONFIGURACIÓN (config.json)
+# CONFIGURACIÓN
 # =============================================================================
 def cargar_configuracion():
     entorno = "windows" if IS_WINDOWS else "linux"
     ruta_config = Path(__file__).parent / "config.json"
     if not ruta_config.exists():
         print(
-            f"\n  {RED}[X] Error crítico: no se encontró config.json en:\n      {ruta_config}{RESET}\n"
+            f"\n  {RED}[X] Error: no se encontró config.json en:\n      {ruta_config}{RESET}\n"
         )
         sys.exit(1)
     try:
         with open(ruta_config, "r", encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
-        print(
-            f"\n  {RED}[X] Error crítico: config.json tiene formato inválido:\n      {e}{RESET}\n"
-        )
+        print(f"\n  {RED}[X] Error: config.json inválido:\n      {e}{RESET}\n")
         sys.exit(1)
     try:
         cfg = data[entorno]
         paths = {k: Path(v) for k, v in cfg["paths"].items()}
         return paths, data["pipeline"], cfg["gallery_dl"]
     except KeyError as e:
-        print(
-            f"\n  {RED}[X] Error crítico: clave faltante en config.json: {e}{RESET}\n"
-        )
+        print(f"\n  {RED}[X] Error: clave faltante en config.json: {e}{RESET}\n")
         sys.exit(1)
 
 
@@ -114,7 +91,7 @@ PATHS, PIPELINE, GDL_CFG = cargar_configuracion()
 
 
 # =============================================================================
-# GESTIÓN DE ESTADO (lotes)
+# ESTADO
 # =============================================================================
 def obtener_hash_lista(lista_path: Path) -> str:
     return hashlib.sha256(lista_path.read_bytes()).hexdigest()
@@ -133,7 +110,6 @@ def cargar_estado() -> dict:
         return default
     with open(state_file, "r", encoding="utf-8") as f:
         state = json.load(f)
-    # Si el índice guardado es mayor que la longitud actual de la lista, reiniciamos (se borraron enlaces)
     if state.get("batch_index", 0) > lista_len:
         print(
             f"\n  {YELLOW}[!] La lista se ha acortado. Reiniciando índice desde 0.{RESET}\n"
@@ -143,13 +119,12 @@ def cargar_estado() -> dict:
 
 
 def guardar_estado(state: dict):
-    # state solo contiene "batch_index", no el hash
     with open(PATHS["state_file"], "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
 
 # =============================================================================
-# UTILIDADES DE TERMINAL
+# UTILIDADES
 # =============================================================================
 def clear_line():
     sys.stdout.write("\r\033[2K")
@@ -186,17 +161,14 @@ def limpiar_error(linea):
 
 
 # =============================================================================
-# SPINNER UNIFICADO
+# SPINNER
 # =============================================================================
 def spinner_thread(estado, lock_print):
-    """Hilo de spinner unificado. Muestra la última línea de actividad
-    encima de la barra animada para que siempre sea visible."""
     idx = 0
     ancho_barra = 24
     while not estado["stop"]:
         elapsed = int(time.time() - estado["inicio"])
         tiempo = formatear_tiempo(elapsed)
-
         resumen = f"{estado['nuevo']} nuevos"
         if estado["done"] > 0:
             resumen += f" | {estado['done']} ya desc."
@@ -210,7 +182,6 @@ def spinner_thread(estado, lock_print):
             vacios = ancho_barra - llenos
             barra_interna = ("━" * llenos) + ("·" * vacios)
             barra_visual = f"{DIM}│{RESET}{ACCENT}{barra_interna}{RESET}{DIM}│{RESET}"
-
             descargado = estado.get("descargado", "")
             total_str = estado.get("total", "")
             size_info = (
@@ -220,14 +191,12 @@ def spinner_thread(estado, lock_print):
 
             anim = SPINNER[idx % len(SPINNER)]
             with lock_print:
-                # Línea de actividad actual encima de la barra
                 if ultima_linea:
                     sys.stdout.write(f"\r\033[2K{ultima_linea}\n")
                 sys.stdout.write(
                     f"\r  {ACCENT}{anim}{RESET} {barra_visual} "
                     f"{pct:>3}% │{size_info}{speed_info} {DIM}{resumen} — {tiempo}{RESET}\033[K"
                 )
-                # Volver arriba para sobreescribir en el próximo tick
                 if ultima_linea:
                     sys.stdout.write("\033[1A")
                 sys.stdout.flush()
@@ -260,9 +229,6 @@ def spinner_thread(estado, lock_print):
 
 
 def parsear_progreso(linea_pura: str) -> dict | None:
-    """Extrae pct, descargado, total y speed de una línea de progreso de gallery-dl.
-    Formato esperado: '45% 2.30 MiB  1.20 MiB/s' o variantes con KB/GB."""
-    # Intentar con total explícito: "45%  2.30 MiB /  5.10 MiB  1.20 MiB/s"
     m = re.match(
         r"(\d+)%\s+([\d.]+)\s*([KkMmGgTt]i?[Bb])\s*/\s*([\d.]+)\s*([KkMmGgTt]i?[Bb])\s+([\d.]+)\s*([KkMmGgTt]i?[Bb]/s)",
         linea_pura.strip(),
@@ -275,7 +241,6 @@ def parsear_progreso(linea_pura: str) -> dict | None:
             "total": f"{float(m.group(4)):.1f}{m.group(5).upper()}",
             "speed": f"{float(m.group(6)):.1f}{m.group(7).upper()}",
         }
-    # Sin total: "45%  2.30 MiB  1.20 MiB/s"
     m = re.match(
         r"(\d+)%\s+([\d.]+)\s*([KkMmGgTt]i?[Bb])\s+([\d.]+)\s*([KkMmGgTt]i?[Bb]/s)",
         linea_pura.strip(),
@@ -292,7 +257,7 @@ def parsear_progreso(linea_pura: str) -> dict | None:
 
 
 # =============================================================================
-# WATCHDOG (timeout de inactividad)
+# WATCHDOG
 # =============================================================================
 def watchdog_thread(proceso, estado, timeout):
     while not estado["stop"]:
@@ -315,13 +280,41 @@ def watchdog_thread(proceso, estado, timeout):
 
 
 # =============================================================================
-# ENGINE DE DESCARGA — WINDOWS
+# VIGILANTE DE .part (Windows)
 # =============================================================================
-def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
-    cmd = [GDL_CFG["executable"], "-c", GDL_CFG["config_file"]]
-    if extra_flags:
-        cmd.extend(extra_flags)
-    cmd.append(url)
+def vigilar_part_thread(estado_watchdog: dict, carpeta_raiz, intervalo: int = 20):
+    tamanos_previos = {}
+    while not estado_watchdog["stop"]:
+        try:
+            if os.path.exists(carpeta_raiz):
+                encontrados = set()
+                for raiz, _, archivos in os.walk(carpeta_raiz):
+                    for archivo in archivos:
+                        if archivo.endswith(".part"):
+                            ruta = os.path.join(raiz, archivo)
+                            encontrados.add(ruta)
+                            try:
+                                tam_actual = os.path.getsize(ruta)
+                            except OSError:
+                                continue
+                            tam_previo = tamanos_previos.get(ruta)
+                            if tam_previo is None or tam_actual > tam_previo:
+                                estado_watchdog["ultimo_archivo"] = time.time()
+                                estado_watchdog["ultimo_output"] = time.time()
+                            tamanos_previos[ruta] = tam_actual
+                for ruta in list(tamanos_previos.keys()):
+                    if ruta not in encontrados:
+                        tamanos_previos.pop(ruta, None)
+        except OSError:
+            pass
+        time.sleep(intervalo)
+
+
+# =============================================================================
+# MOTOR WINDOWS
+# =============================================================================
+def descargar_windows(url: str, nombre_modelo: str):
+    cmd = [GDL_CFG["executable"], "-c", GDL_CFG["config_file"], url]
 
     inicio = time.time()
     archivos_nuevos = []
@@ -348,7 +341,6 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
         "timeout": False,
     }
 
-    # <<< CAMBIO: try externo que garantiza restauración del cursor
     try:
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
@@ -396,10 +388,16 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
             daemon=True,
         )
         stderr_thr = threading.Thread(target=leer_stderr, daemon=True)
+        part_watch = threading.Thread(
+            target=vigilar_part_thread,
+            args=(estado_watchdog, PATHS["rips_dir"]),
+            daemon=True,
+        )
 
         spin.start()
         watch.start()
         stderr_thr.start()
+        part_watch.start()
 
         try:
             for linea in proceso.stdout:
@@ -440,7 +438,7 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
             estado_watchdog["stop"] = True
             spin.join(timeout=2)
             watch.join(timeout=2)
-            # <<< ELIMINADO: la restauración del cursor se hará en el finally externo
+            part_watch.join(timeout=2)
 
         returncode = proceso.returncode if proceso.returncode is not None else -1
 
@@ -455,19 +453,15 @@ def descargar_windows(url: str, nombre_modelo: str, extra_flags=None):
             returncode,
         )
     finally:
-        # <<< CAMBIO: restauración garantizada del cursor
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
 
 
 # =============================================================================
-# ENGINE DE DESCARGA — LINUX (PTY)
+# MOTOR LINUX
 # =============================================================================
-def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
-    cmd = [GDL_CFG["executable"], "-c", GDL_CFG["config_file"]]
-    if extra_flags:
-        cmd.extend(extra_flags)
-    cmd.append(url)
+def descargar_linux(url: str, nombre_modelo: str):
+    cmd = [GDL_CFG["executable"], "-c", GDL_CFG["config_file"], url]
 
     inicio = time.time()
     archivos_nuevos = []
@@ -497,7 +491,6 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
         "ultima_linea": "",
     }
 
-    # <<< CAMBIO: try externo que garantiza restauración del cursor
     try:
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
@@ -588,6 +581,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
                                     estado_spinner["descargado"] = datos["descargado"]
                                     estado_spinner["total"] = datos["total"]
                                     estado_spinner["speed"] = datos["speed"]
+                                    ultimo_archivo = time.time()
                             continue
 
                     if es_linea_complete:
@@ -610,6 +604,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
                                 estado_spinner["descargado"] = datos["descargado"]
                                 estado_spinner["total"] = datos["total"]
                                 estado_spinner["speed"] = datos["speed"]
+                                ultimo_archivo = time.time()
                             continue
 
                         es_done = "\x1b[2m" in linea_limpia
@@ -690,7 +685,6 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
             estado_spinner["stop"] = True
             spin.join(timeout=2)
             clear_line()
-            # <<< ELIMINADO: restauración del cursor aquí (se hará en el finally externo)
             if master_fd is not None:
                 try:
                     os.close(master_fd)
@@ -714,46 +708,27 @@ def descargar_linux(url: str, nombre_modelo: str, extra_flags=None):
             returncode,
         )
     finally:
-        # <<< CAMBIO: restauración garantizada del cursor
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
 
 
 # =============================================================================
-# CAPA DE EJECUCIÓN: despacha al engine correcto
+# EJECUTOR DE URL
 # =============================================================================
 def ejecutar_url(url: str) -> dict:
-    extra_flags = []
-    temp_config_file = None
-
-    # Detectar ?images para descargar solo imágenes
-    if url.endswith("?images"):
-        temp_config_file = crear_config_imagenes_temp()
-        extra_flags.extend(["-c", temp_config_file])
-        url = url.replace("?images", "").strip()
-        print(f"  {CYAN}[!] Modo solo-imágenes activado para esta URL{RESET}")
-
     nombre = url.rstrip("/").split("/")[-1][:60]
     log_path = PATHS["log_dir"] / f"{nombre}.log"
     PATHS["log_dir"].mkdir(parents=True, exist_ok=True)
 
     if IS_WINDOWS:
         archivos, errs, warns, nuevos, done, timeout, duracion, returncode = (
-            descargar_windows(url, nombre, extra_flags)
+            descargar_windows(url, nombre)
         )
     else:
         archivos, errs, warns, nuevos, done, timeout, duracion, returncode = (
-            descargar_linux(url, nombre, extra_flags)
+            descargar_linux(url, nombre)
         )
 
-    # Limpiar archivo temporal si se creó
-    if temp_config_file and os.path.exists(temp_config_file):
-        try:
-            os.unlink(temp_config_file)
-        except OSError:
-            pass
-
-    # Log completo (compatible con auditar.py)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nURL: {url}\n")
         if archivos:
@@ -792,7 +767,6 @@ def ejecutar_url(url: str) -> dict:
 # PROCESADOR DE LOTE
 # =============================================================================
 def _imprimir_resumen_url(res: dict):
-    """Imprime la línea de resumen coloreada para una URL procesada."""
     nombre = res["nombre"]
     nuevos = res["nuevos"]
     done = res["done"]
@@ -801,7 +775,7 @@ def _imprimir_resumen_url(res: dict):
     resumen = f"{nuevos} nuevos" + (f" | {done} ya descargados" if done > 0 else "")
     warn_str = f" | {warnings} warning(s)" if warnings > 0 else ""
 
-    print()  # separación tras la última línea live del engine
+    print()
 
     if res["timeout"]:
         print(
@@ -822,7 +796,6 @@ def _imprimir_resumen_url(res: dict):
 
 
 def procesar_lote(lote: list):
-    # ── Deduplicación por ID numérico (protección contra URLs duplicadas) ──
     lote_dedup = []
     vistos: set = set()
     for url in lote:
@@ -873,7 +846,6 @@ def procesar_lote(lote: list):
             print(f"\n  {DIM}Esperando {SLEEP_ENTRE_URLS}s...{RESET}\n")
             time.sleep(SLEEP_ENTRE_URLS)
 
-    # ── Resumen final ──────────────────────────────────────────────────────────
     print(f"\n{BOLD}{'═' * 55}{RESET}")
     print(f"  Lote terminado — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -909,11 +881,53 @@ def procesar_lote(lote: list):
 def main():
     import shutil
 
+    CENTINELA = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "descarga.running"
+    )
+
+    if os.path.exists(CENTINELA):
+        if time.time() - os.path.getmtime(CENTINELA) > 60:
+            os.remove(CENTINELA)
+
+    # Abrir monitor en split de Windows Terminal
+    if IS_WINDOWS and os.environ.get("WT_SESSION"):
+        monitor_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "monitor.py"
+        )
+        if os.path.exists(monitor_script):
+            subprocess.Popen(
+                [
+                    "wt",
+                    "-w",
+                    "0",
+                    "split-pane",
+                    "--horizontal",
+                    "--size",
+                    "0.35",
+                    "--title",
+                    "Monitor",
+                    "python",
+                    monitor_script,
+                ],
+                shell=False,
+            )
+            # Devolver el foco al panel principal (llamada separada, más segura
+            # que meter ';focus-pane' en el mismo comando)
+            time.sleep(1)
+            try:
+                subprocess.Popen(
+                    ["wt", "-w", "0", "focus-pane", "-t", "0"],
+                    shell=False,
+                )
+            except OSError:
+                pass
+
+    open(CENTINELA, "w").close()
+
     try:
-        # Validar que gallery-dl esté disponible
         if not shutil.which(GDL_CFG["executable"]):
             print(
-                f"\n  {RED}[X] Error crítico: '{GDL_CFG['executable']}' no encontrado en PATH.{RESET}"
+                f"\n  {RED}[X] Error: '{GDL_CFG['executable']}' no encontrado en PATH.{RESET}"
             )
             print("      Instala gallery-dl y asegúrate de que esté en el PATH.\n")
             if IS_WINDOWS:
@@ -934,9 +948,7 @@ def main():
             print()
             print(f"  {GREEN}[+] Lista completada. Reiniciando índice.{RESET}")
             print()
-            nuevo_state = {
-                "batch_index": 0,
-            }
+            nuevo_state = {"batch_index": 0}
             guardar_estado(nuevo_state)
             lote = lista[:batch_size]
             state = nuevo_state
@@ -946,7 +958,6 @@ def main():
         state["batch_index"] += len(lote)
         guardar_estado(state)
 
-        # Auditoría automática
         auditar_py = Path(__file__).parent / "auditar.py"
         if auditar_py.exists():
             print(f"  {CYAN}Ejecutando auditoría...{RESET}\n")
@@ -958,10 +969,12 @@ def main():
             input(f"\n  {GRAY}Presiona Enter para salir...{RESET}")
 
     except KeyboardInterrupt:
-        print(f"\n\n  {YELLOW}[!] Interrupción por usuario.{RESET}")
+        print(f"\n  {YELLOW}[!] Interrupción por usuario.{RESET}\n")
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
-        sys.exit(130)
+    finally:
+        if os.path.exists(CENTINELA):
+            os.remove(CENTINELA)
 
 
 if __name__ == "__main__":
