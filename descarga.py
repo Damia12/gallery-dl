@@ -57,12 +57,13 @@ KEYWORDS_RUIDO = [
 ]
 
 TIMEOUT_ACTIVIDAD = 900
+TIMEOUT_ACTIVIDAD_LENTO = 7200  # 2 horas para Bunkr / Simpcity
 TIMEOUT_SIN_ARCHIVOS = 1800
 SLEEP_ENTRE_URLS = 10
 
 
 # =============================================================================
-# CONFIGURACIÓN
+# CONFIGURACION
 # =============================================================================
 def cargar_configuracion():
     entorno = "windows" if IS_WINDOWS else "linux"
@@ -88,6 +89,239 @@ def cargar_configuracion():
 
 
 PATHS, PIPELINE, GDL_CFG = cargar_configuracion()
+
+
+# =============================================================================
+# SKIP POSTS  (soporta string directo o dict con "skip")
+# =============================================================================
+def cargar_skip_posts() -> dict:
+    """Carga el mapa URL → --post-range directo (string).
+
+    Soporta dos formatos:
+
+    Formato A (directo): URL -> "post-range" string
+    {
+      "https://simpcity.su/threads/nombre.12345": "6-"
+    }
+
+    Formato B (skip): URL -> dict con lista de posts a saltear
+    {
+      "https://simpcity.su/threads/nombre.12345": {"skip": [6]},
+      "https://simpcity.su/threads/otro.67890": {"skip": [3, 6, 9]}
+    }
+    """
+    skip_file = PATHS.get("skip_posts_file")
+    if not skip_file or not skip_file.exists():
+        return {}
+    try:
+        with open(skip_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        validado = {}
+        for k, v in data.items():
+            if k.startswith("_"):
+                continue
+            if (
+                isinstance(v, str)
+                or isinstance(v, dict)
+                and ("skip" in v or "omitir" in v)
+            ):
+                validado[k.rstrip("/")] = v
+            else:
+                print(
+                    f"  {YELLOW}[!] Skip posts: valor inválido para '{k}' "
+                    f"(se esperaba string o dict con 'skip'). Se ignora.{RESET}"
+                )
+        return validado
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def convertir_skip_a_range(valor: dict) -> str | None:
+    """Convierte {'skip': [3, 6, '1-5', 50]} en string de --post-range."""
+    rangos = valor.get("skip") or valor.get("omitir", [])
+    if not rangos:
+        return None
+
+    skip_set = set()
+    for r in rangos:
+        r = str(r).strip()
+        if "-" in r:
+            partes = r.split("-")
+            if len(partes) == 2 and partes[0] and partes[1]:
+                try:
+                    ini, fin = int(partes[0]), int(partes[1])
+                    skip_set.update(range(ini, fin + 1))
+                except ValueError:
+                    continue
+        else:
+            try:
+                skip_set.add(int(r))
+            except ValueError:
+                continue
+
+    if not skip_set:
+        return None
+
+    max_skip = max(skip_set)
+    limite_superior = max_skip + 10000
+
+    descargar = []
+    inicio = 1
+    while inicio <= limite_superior:
+        if inicio in skip_set:
+            inicio += 1
+            continue
+        fin = inicio
+        while fin + 1 <= limite_superior and (fin + 1) not in skip_set:
+            fin += 1
+        if fin >= limite_superior:
+            descargar.append(f"{inicio}-")
+            break
+        else:
+            descargar.append(f"{inicio}-{fin}")
+            inicio = fin + 1
+
+    if not descargar:
+        return None
+
+    return ",".join(descargar)
+
+
+# =============================================================================
+# POSTS FALLIDOS  (reporte de sugerencias, NO se aplica automáticamente)
+# =============================================================================
+
+
+def obtener_posts_fallidos_path() -> Path:
+    """Devuelve la ruta de posts_fallidos.json (misma carpeta que skip_posts)."""
+    skip_file = PATHS.get("skip_posts_file")
+    if skip_file:
+        return skip_file.parent / "posts_fallidos.json"
+    return Path(__file__).parent / "posts_fallidos.json"
+
+
+def cargar_posts_fallidos() -> dict:
+    """Carga el reporte de posts fallidos sugeridos."""
+    pf_path = obtener_posts_fallidos_path()
+    if not pf_path.exists():
+        return {}
+    try:
+        with open(pf_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def guardar_posts_fallidos(data: dict):
+    """Guarda el reporte de posts fallidos."""
+    pf_path = obtener_posts_fallidos_path()
+    try:
+        with open(pf_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        print(f"  {YELLOW}[!] No se pudo guardar posts_fallidos.json: {e}{RESET}")
+
+
+def extraer_posts_desde_range(post_range: str | None) -> set:
+    """Extrae los posts numéricos de un string de post-range."""
+    posts = set()
+    if not post_range or post_range == "none":
+        return posts
+    for parte in post_range.split(","):
+        parte = parte.strip()
+        if "-" in parte:
+            ini_fin = parte.split("-")
+            if len(ini_fin) == 2:
+                try:
+                    ini = int(ini_fin[0])
+                    fin_str = ini_fin[1].strip()
+                    if fin_str:
+                        posts.update(range(ini, int(fin_str) + 1))
+                    else:
+                        posts.add(ini)
+                except ValueError:
+                    pass
+        else:
+            try:
+                posts.add(int(parte))
+            except ValueError:
+                pass
+    return posts
+
+
+def detectar_y_reportar_fallidos(
+    url: str,
+    res: dict,
+    post_range: str | None,
+    rangos_skip_previos: list | None,
+):
+    """Detecta posts candidatos a fallidos y guarda en posts_fallidos.json como reporte."""
+    fallidos = cargar_posts_fallidos()
+    url_key = url.rstrip("/")
+
+    # Solo reportar si hay timeout total o fatal
+    if res["timeout"] and res["nuevos"] == 0:
+        estado = "timeout_atascado"
+    elif res["errores"] > 0 and res["returncode"] != 0:
+        estado = "fatal"
+    else:
+        return  # No reportar nada si hubo progreso o está OK
+
+    posts_intentados = extraer_posts_desde_range(post_range)
+    if not posts_intentados:
+        return
+
+    ya_skipeados = set()
+    if rangos_skip_previos:
+        ya_skipeados.update(rangos_skip_previos)
+
+    candidatos = sorted(posts_intentados - ya_skipeados)
+    if not candidatos:
+        return
+
+    if url_key not in fallidos:
+        fallidos[url_key] = {
+            "skip": [],
+            "razon": estado,
+            "fecha": datetime.now().strftime("%Y-%m-%d"),
+            "intentos": 0,
+        }
+
+    existing = set(fallidos[url_key].get("skip", []))
+    existing.update(candidatos)
+    fallidos[url_key]["skip"] = sorted(existing)
+    fallidos[url_key]["razon"] = estado
+    fallidos[url_key]["fecha"] = datetime.now().strftime("%Y-%m-%d")
+    fallidos[url_key]["intentos"] = fallidos[url_key].get("intentos", 0) + 1
+
+    guardar_posts_fallidos(fallidos)
+    print(
+        f"  {YELLOW}[FALLIDOS] {len(candidatos)} post(s) sugerido(s) para skip — "
+        f"revisar posts_fallidos.json antes de aplicar{RESET}"
+    )
+
+
+def imprimir_resumen_fallidos():
+    """Muestra al final del lote cuántos posts fallidos hay acumulados."""
+    fallidos = cargar_posts_fallidos()
+    if not fallidos:
+        return
+    total = sum(len(v.get("skip", [])) for v in fallidos.values())
+    urls = len(fallidos)
+    print(
+        f"  {YELLOW}⚠️  Posts fallidos detectados (acumulados): {total} en {urls} URL(s){RESET}"
+    )
+    print(
+        f"  {GRAY}   Revisar posts_fallidos.json para aplicar manualmente a skip_posts.json{RESET}"
+    )
+
+
+def obtener_timeout_por_url(url: str) -> int:
+    """Devuelve timeout largo para sitios que suelen tardar mucho (Bunkr, Simpcity)."""
+    u = url.lower()
+    if any(x in u for x in ["bunkr", "bunkrr", "simpcity"]):
+        return TIMEOUT_ACTIVIDAD_LENTO
+    return TIMEOUT_ACTIVIDAD
 
 
 # =============================================================================
@@ -310,11 +544,11 @@ def vigilar_part_thread(estado_watchdog: dict, carpeta_raiz, intervalo: int = 20
         time.sleep(intervalo)
 
 
-# =============================================================================
-# MOTOR WINDOWS
-# =============================================================================
-def descargar_windows(url: str, nombre_modelo: str):
-    cmd = [GDL_CFG["executable"], "-c", GDL_CFG["config_file"], url]
+def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = None):
+    cmd = [GDL_CFG["executable"], "-c", GDL_CFG["config_file"]]
+    if extra_args:
+        cmd.extend(extra_args)
+    cmd.append(url)
 
     inicio = time.time()
     archivos_nuevos = []
@@ -384,7 +618,7 @@ def descargar_windows(url: str, nombre_modelo: str):
         )
         watch = threading.Thread(
             target=watchdog_thread,
-            args=(proceso, estado_watchdog, TIMEOUT_ACTIVIDAD),
+            args=(proceso, estado_watchdog, obtener_timeout_por_url(url)),
             daemon=True,
         )
         stderr_thr = threading.Thread(target=leer_stderr, daemon=True)
@@ -460,8 +694,11 @@ def descargar_windows(url: str, nombre_modelo: str):
 # =============================================================================
 # MOTOR LINUX
 # =============================================================================
-def descargar_linux(url: str, nombre_modelo: str):
-    cmd = [GDL_CFG["executable"], "-c", GDL_CFG["config_file"], url]
+def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None):
+    cmd = [GDL_CFG["executable"], "-c", GDL_CFG["config_file"]]
+    if extra_args:
+        cmd.extend(extra_args)
+    cmd.append(url)
 
     inicio = time.time()
     archivos_nuevos = []
@@ -504,6 +741,7 @@ def descargar_linux(url: str, nombre_modelo: str):
         proceso = None
         buffer = ""
         ultimo_output = time.time()
+        timeout_val = obtener_timeout_por_url(url)
 
         try:
             master_fd, slave_fd = pty.openpty()
@@ -517,7 +755,7 @@ def descargar_linux(url: str, nombre_modelo: str):
 
                 if not r:
                     ahora = time.time()
-                    if ahora - ultimo_output > TIMEOUT_ACTIVIDAD:
+                    if ahora - ultimo_output > timeout_val:
                         try:
                             proceso.kill()
                         except OSError:
@@ -715,22 +953,53 @@ def descargar_linux(url: str, nombre_modelo: str):
 # =============================================================================
 # EJECUTOR DE URL
 # =============================================================================
-def ejecutar_url(url: str) -> dict:
+def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
     nombre = url.rstrip("/").split("/")[-1][:60]
     log_path = PATHS["log_dir"] / f"{nombre}.log"
     PATHS["log_dir"].mkdir(parents=True, exist_ok=True)
+    extra_args = []
+    post_range = None
+    rangos_skip = None
+
+    if skip_posts:
+        url_key = url.rstrip("/")
+        post_range = skip_posts.get(url_key) or skip_posts.get(url_key + "/")
+        if post_range:
+            if isinstance(post_range, dict) and (
+                "skip" in post_range or "omitir" in post_range
+            ):
+                rangos_skip = post_range.get("skip") or post_range.get("omitir", [])
+                post_range = convertir_skip_a_range(post_range)
+                if post_range:
+                    extra_args = ["--post-range", post_range]
+                    print(
+                        f"  {YELLOW}[RANGE] Descargando posts: {post_range}  (skipeados: {', '.join(map(str, rangos_skip))}){RESET}"
+                    )
+            else:
+                extra_args = ["--post-range", post_range]
+                print(f"  {YELLOW}[RANGE] Descargando posts: {post_range}{RESET}")
 
     if IS_WINDOWS:
         archivos, errs, warns, nuevos, done, timeout, duracion, returncode = (
-            descargar_windows(url, nombre)
+            descargar_windows(url, nombre, extra_args)
         )
     else:
         archivos, errs, warns, nuevos, done, timeout, duracion, returncode = (
-            descargar_linux(url, nombre)
+            descargar_linux(url, nombre, extra_args)
         )
+    # Deduplicar archivos (gallery-dl puede listar duplicados en stdout)
+    archivos_unicos = list(dict.fromkeys(archivos))
+    archivos = archivos_unicos
+    nuevos = len(archivos)
 
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nURL: {url}\n")
+        if extra_args:
+            f.write(f"Extra args: {' '.join(extra_args)}\n")
+        if post_range:
+            f.write(f"Post range: {post_range}\n")
+        if rangos_skip:
+            f.write(f"Posts omitidos: {', '.join(map(str, rangos_skip))}\n")
         if archivos:
             f.write("\n".join(archivos) + "\n")
         if errs:
@@ -742,10 +1011,29 @@ def ejecutar_url(url: str) -> dict:
         resumen_forense = (
             f'[RESUMEN] nombre_modelo="{nombre}" url="{url}" nuevos="{nuevos}" '
             f'ya_descargados="{done}" errores="{len(errs)}" warnings="{len(warns)}" '
-            f'duracion="{duracion}" returncode="{returncode}" timeout="{timeout}"\n'
+            f'duracion="{duracion}" returncode="{returncode}" timeout="{timeout}" '
+            f'post_range="{post_range or "none"}"\n'
         )
         f.write(resumen_forense)
         f.write("=" * 60 + "\n\n")
+
+    # Reportar posts candidatos a fallidos (no se aplica automáticamente)
+    detectar_y_reportar_fallidos(
+        url,
+        {
+            "nombre": nombre,
+            "ok": not timeout and len(errs) == 0,
+            "nuevos": nuevos,
+            "done": done,
+            "errores": len(errs),
+            "warnings": len(warns),
+            "timeout": timeout,
+            "duracion": duracion,
+            "returncode": returncode,
+        },
+        post_range,
+        rangos_skip,
+    )
 
     return {
         "nombre": nombre,
@@ -807,6 +1095,7 @@ def procesar_lote(lote: list):
 
     omitidas = len(lote) - len(lote_dedup)
     total = len(lote_dedup)
+    skip_posts = cargar_skip_posts()
 
     print(f"{BOLD}{'═' * 55}{RESET}")
     print(
@@ -828,7 +1117,7 @@ def procesar_lote(lote: list):
         )
         print(f"  {GRAY}{url}{RESET}\n")
 
-        res = ejecutar_url(url)
+        res = ejecutar_url(url, skip_posts=skip_posts)
         _imprimir_resumen_url(res)
 
         totales["nuevos"] += res["nuevos"]
@@ -873,6 +1162,7 @@ def procesar_lote(lote: list):
         f"  Tiempo total        : {BOLD}{formatear_tiempo(totales['duracion'])}{RESET}"
     )
     print(f"{BOLD}{'═' * 55}{RESET}\n")
+    imprimir_resumen_fallidos()
 
 
 # =============================================================================
@@ -911,8 +1201,6 @@ def main():
                 ],
                 shell=False,
             )
-            # Devolver el foco al panel principal (llamada separada, más segura
-            # que meter ';focus-pane' en el mismo comando)
             time.sleep(1)
             try:
                 subprocess.Popen(

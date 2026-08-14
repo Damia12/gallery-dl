@@ -5,15 +5,37 @@ Uso: python monitor.py [--rips-dir G:/Rips] [--intervalo 1]
 """
 
 import argparse
+import json
 import os
 import sys
 import time
 from collections import deque
+from pathlib import Path
 
 IS_WINDOWS = sys.platform == "win32"
-RIPS_DIR = r"G:\Rips" if IS_WINDOWS else os.path.expanduser("~/Rips")
 
-VENTANA_ACTIVO = 5
+# =============================================================================
+# CONFIGURACIÓN — leer desde config.json (igual que descarga.py)
+# =============================================================================
+def cargar_rips_dir() -> str:
+    script_dir = Path(__file__).parent
+    config_path = script_dir / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            entorno = "windows" if IS_WINDOWS else "linux"
+            raw = data.get(entorno, {}).get("paths", {}).get("rips_dir", "")
+            if raw:
+                return os.path.expandvars(os.path.expanduser(raw))
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return r"G:\Rips" if IS_WINDOWS else os.path.expanduser("~/Rips")
+
+RIPS_DIR = cargar_rips_dir()
+
+VENTANA_ACTIVO = 30   # archivos .part que crecieron en los últimos 30s
+VENTANA_INACTIVO = 120  # archivos .part que existen pero no crecen (hasta 120s)
 VENTANA_VEL = 3
 
 RESET = "\033[0m"
@@ -53,20 +75,29 @@ def fmt_bytes(b):
 
 
 def get_active_parts(rips_dir):
+    """Escanea recursivamente archivos .part y los clasifica en activos/inactivos."""
     ahora = time.time()
-    candidatos = []
+    activos = []
+    inactivos = []
     for root, _, files in os.walk(rips_dir):
         for fname in files:
             if fname.endswith(".part"):
                 ruta = os.path.join(root, fname)
                 try:
                     st = os.stat(ruta)
-                    if (ahora - st.st_mtime) <= VENTANA_ACTIVO:
-                        candidatos.append((st.st_mtime, ruta, fname, st.st_size))
+                    age = ahora - st.st_mtime
+                    if age <= VENTANA_ACTIVO:
+                        activos.append((st.st_mtime, ruta, fname, st.st_size))
+                    elif age <= VENTANA_INACTIVO:
+                        inactivos.append((st.st_mtime, ruta, fname, st.st_size))
                 except OSError:
                     pass
-    candidatos.sort(key=lambda x: x[0], reverse=True)
-    return [(r, n, t) for _, r, n, t in candidatos]
+    activos.sort(key=lambda x: x[0], reverse=True)
+    inactivos.sort(key=lambda x: x[0], reverse=True)
+    return (
+        [(r, n, t) for _, r, n, t in activos],
+        [(r, n, t) for _, r, n, t in inactivos]
+    )
 
 
 def ruta_corta(ruta_completa, rips_dir, maxlen=60):
@@ -77,17 +108,19 @@ def ruta_corta(ruta_completa, rips_dir, maxlen=60):
 HEADER_LINES = 5
 
 
-def dibujar_panel(activos, historiales, spin_idx, rips_dir, ultimas_filas):
+def dibujar_panel(activos, inactivos, historiales, spin_idx, rips_dir, ultimas_filas):
     ahora = time.monotonic()
     lineas = []
 
-    if not activos:
+    if not activos and not inactivos:
         lineas.append(f"  {GRAY}Sin descarga activa — esperando .part...{RESET}")
         lineas.append("")
     else:
+        # Activos (creciendo)
         for ruta, nombre, tamanio in activos:
             rel = ruta_corta(ruta, rips_dir)
-            hist = historiales[nombre]
+            # FIX: clave por ruta completa, no por nombre base
+            hist = historiales.get(ruta, deque())
 
             hist.append((ahora, tamanio))
             while hist and (ahora - hist[0][0]) > VENTANA_VEL:
@@ -108,6 +141,15 @@ def dibujar_panel(activos, historiales, spin_idx, rips_dir, ultimas_filas):
             lineas.append(f"  {GRAY}📄{RESET} {YELLOW}{rel}{RESET}")
             lineas.append(
                 f"  {color}{spin}{RESET}  {BOLD}{fmt_bytes(tamanio)}{RESET} descargados   {color}{vel_str}{RESET}"
+            )
+            lineas.append("")
+
+        # Inactivos recientes (sin crecer, pero existen)
+        for ruta, nombre, tamanio in inactivos:
+            rel = ruta_corta(ruta, rips_dir)
+            lineas.append(f"  {GRAY}📄 {rel}{RESET}")
+            lineas.append(
+                f"  {GRAY}⏸  {fmt_bytes(tamanio)} descargados   inactivo reciente{RESET}"
             )
             lineas.append("")
 
@@ -151,11 +193,11 @@ def main():
     print(f"{CYAN}{BOLD}  {'═' * 58}{RESET}")
     print(f"{CYAN}{BOLD}  MONITOR DE DESCARGA ACTIVA{RESET}")
     print(f"{GRAY}  Dir: {rips_dir}{RESET}")
-    print(f"{GRAY}  Ctrl+C para salir{RESET}")
+    print(f"{GRAY}  Ventana activa: {VENTANA_ACTIVO}s | Ctrl+C para salir{RESET}")
     print(f"{CYAN}{BOLD}  {'═' * 58}{RESET}")
     sys.stdout.flush()
 
-    historiales = {}
+    historiales = {}  # FIX: clave = ruta completa, no nombre base
     spin_idx = 0
     ultimas_filas = 0
 
@@ -164,19 +206,21 @@ def main():
             if not os.path.exists(CENTINELA):
                 break
 
-            activos = get_active_parts(rips_dir)
+            activos, inactivos = get_active_parts(rips_dir)
 
-            nombres_activos = {n for _, n, _ in activos}
-            for _, nombre, _ in activos:
-                if nombre not in historiales:
-                    historiales[nombre] = deque()
+            # FIX: usar ruta completa como clave para evitar colisiones
+            todas_rutas = {r for r, _, _ in activos + inactivos}
 
-            for n in list(historiales):
-                if n not in nombres_activos:
-                    del historiales[n]
+            for ruta in todas_rutas:
+                if ruta not in historiales:
+                    historiales[ruta] = deque()
+
+            for ruta in list(historiales):
+                if ruta not in todas_rutas:
+                    del historiales[ruta]
 
             ultimas_filas = dibujar_panel(
-                activos, historiales, spin_idx, rips_dir, ultimas_filas
+                activos, inactivos, historiales, spin_idx, rips_dir, ultimas_filas
             )
             spin_idx += 1
             time.sleep(intervalo)

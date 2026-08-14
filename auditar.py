@@ -67,6 +67,7 @@ AUDIT_CSV = CFG["audit_csv"]
 # Línea [RESUMEN] escrita por descarga.py — pares clave="valor"
 RE_RESUMEN = re.compile(r"\[RESUMEN\](.+)", re.IGNORECASE)
 RE_KV = re.compile(r'(\w+)="([^"]*)"')
+RE_POSTS_OMITIDOS = re.compile(r"Post[s]? omitidos: (.+)", re.IGNORECASE)
 
 # Errores en el cuerpo del log (stdout/stderr de gallery-dl)
 RE_ERR = re.compile(
@@ -144,9 +145,11 @@ CSV_HEADER = [
     "Fecha",
     "Nombre_Modelo",
     "URL",
+    "Post_omitidos",
     "Nuevos",
     "Ya_descargados",
     "Errores",
+    "Errores_detalle",
     "Duracion_s",
     "Returncode",
     "Timeout",
@@ -289,6 +292,39 @@ def analizar_logs():
                 if m:
                     resumen = dict(RE_KV.findall(m.group(1)))
 
+            # ── Extraer posts omitidos ───────────────────────────────────────
+            posts_omitidos = ""
+            for linea in lineas:
+                m = RE_POSTS_OMITIDOS.search(linea)
+                if m:
+                    posts_omitidos = m.group(1).strip()
+                    break
+
+            # ── Extraer errores detalle ──────────────────────────────────────
+            errores_detalle = []
+            en_seccion_errores = False
+            for linea in lineas:
+                ls = linea.strip()
+                if ls == "ERRORES:":
+                    en_seccion_errores = True
+                    continue
+                if en_seccion_errores:
+                    if (
+                        not ls
+                        or ls
+                        in ("WARNINGS:", "[RESUMEN]", "Sin errores.", "Sin warnings.")
+                        or ls.startswith("=")
+                    ):
+                        break
+                    if ls not in errores_detalle:
+                        errores_detalle.append(ls)
+
+            errores_str = " | ".join(errores_detalle[:5])  # máx 5 errores únicos
+            if len(errores_str) > 500:
+                errores_str = errores_str[:497] + "..."
+            if not errores_str:
+                errores_str = "Ninguno"
+
             if not resumen:
                 # Log sin [RESUMEN]: proceso interrumpido o log vacío
                 conteo["sin_resumen"] += 1
@@ -332,9 +368,11 @@ def analizar_logs():
                     ahora_str,
                     nombre,
                     url,
+                    posts_omitidos,
                     nuevos,
                     ya,
                     errores,
+                    errores_str,
                     duracion,
                     rc,
                     "Sí" if timeout else "No",
