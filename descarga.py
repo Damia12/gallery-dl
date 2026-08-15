@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import errno
-import hashlib
 import json
 import os
 import re
@@ -120,10 +119,8 @@ def cargar_skip_posts() -> dict:
         for k, v in data.items():
             if k.startswith("_"):
                 continue
-            if (
-                isinstance(v, str)
-                or isinstance(v, dict)
-                and ("skip" in v or "omitir" in v)
+            if isinstance(v, str) or (
+                isinstance(v, dict) and ("skip" in v or "omitir" in v)
             ):
                 validado[k.rstrip("/")] = v
             else:
@@ -316,6 +313,20 @@ def imprimir_resumen_fallidos():
     )
 
 
+def limpiar_fallidos_si_exito(url: str, res: dict):
+    """Si la URL se descargó con éxito, la elimina de posts_fallidos.json."""
+    if not res.get("ok"):
+        return
+    fallidos = cargar_posts_fallidos()
+    url_key = url.rstrip("/")
+    if url_key in fallidos:
+        del fallidos[url_key]
+        guardar_posts_fallidos(fallidos)
+        print(
+            f"  {GREEN}[LIMPIEZA] URL removida de posts_fallidos.json (descarga OK){RESET}"
+        )
+
+
 def obtener_timeout_por_url(url: str) -> int:
     """Devuelve timeout largo para sitios que suelen tardar mucho (Bunkr, Simpcity)."""
     u = url.lower()
@@ -327,18 +338,12 @@ def obtener_timeout_por_url(url: str) -> int:
 # =============================================================================
 # ESTADO
 # =============================================================================
-def obtener_hash_lista(lista_path: Path) -> str:
-    return hashlib.sha256(lista_path.read_bytes()).hexdigest()
 
 
-def cargar_estado() -> dict:
+def cargar_estado(lista: list) -> dict:
     state_file = PATHS["state_file"]
-    lista = [
-        l.strip()
-        for l in PATHS["lista_file"].read_text(encoding="utf-8").splitlines()
-        if l.strip() and not l.startswith("#")
-    ]
     lista_len = len(lista)
+
     default = {"batch_index": 0}
     if not state_file.exists():
         return default
@@ -514,7 +519,7 @@ def watchdog_thread(proceso, estado, timeout):
 
 
 # =============================================================================
-# VIGILANTE DE .part (Windows)
+# VIGILANTE DE .part
 # =============================================================================
 def vigilar_part_thread(estado_watchdog: dict, carpeta_raiz, intervalo: int = 20):
     tamanos_previos = {}
@@ -709,8 +714,12 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
     contador_warnings = 0
     contador_seq = 0
     ultima_ruta = ""
-    timeout_ocurrido = False
-    ultimo_archivo = time.time()
+    estado_watchdog = {
+        "stop": False,
+        "ultimo_output": time.time(),
+        "ultimo_archivo": time.time(),
+        "timeout": False,
+    }
 
     env_vars = os.environ.copy()
     env_vars["PYTHONUNBUFFERED"] = "1"
@@ -737,10 +746,17 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
         )
         spin.start()
 
+        part_watch = threading.Thread(
+            target=vigilar_part_thread,
+            args=(estado_watchdog, PATHS["rips_dir"]),
+            daemon=True,
+        )
+        part_watch.start()
+
         master_fd = None
         proceso = None
         buffer = ""
-        ultimo_output = time.time()
+        estado_watchdog["ultimo_output"] = time.time()
         timeout_val = obtener_timeout_por_url(url)
 
         try:
@@ -750,24 +766,30 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
             )
             os.close(slave_fd)
 
+            watch = threading.Thread(
+                target=watchdog_thread,
+                args=(proceso, estado_watchdog, obtener_timeout_por_url(url)),
+                daemon=True,
+            )
+            watch.start()
+
             while True:
                 r, _, _ = select.select([master_fd], [], [], 1.0)
 
                 if not r:
                     ahora = time.time()
-                    if ahora - ultimo_output > timeout_val:
+                    if ahora - estado_watchdog["ultimo_output"] > timeout_val:
                         try:
                             proceso.kill()
                         except OSError:
                             pass
-                        timeout_ocurrido = True
+                        estado_watchdog["timeout"] = True
                         break
-                    if ahora - ultimo_archivo > TIMEOUT_SIN_ARCHIVOS:
+                    if ahora - estado_watchdog["ultimo_archivo"] > TIMEOUT_SIN_ARCHIVOS:
                         try:
                             proceso.kill()
                         except OSError:
                             pass
-                        timeout_ocurrido = True
                         break
                     continue
 
@@ -781,7 +803,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                 if not chunk:
                     break
 
-                ultimo_output = time.time()
+                estado_watchdog["ultimo_output"] = time.time()
                 buffer += chunk
                 buffer = buffer.replace("\r\n", "\n")
 
@@ -819,7 +841,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                                     estado_spinner["descargado"] = datos["descargado"]
                                     estado_spinner["total"] = datos["total"]
                                     estado_spinner["speed"] = datos["speed"]
-                                    ultimo_archivo = time.time()
+                                    estado_watchdog["ultimo_archivo"] = time.time()
                             continue
 
                     if es_linea_complete:
@@ -842,7 +864,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                                 estado_spinner["descargado"] = datos["descargado"]
                                 estado_spinner["total"] = datos["total"]
                                 estado_spinner["speed"] = datos["speed"]
-                                ultimo_archivo = time.time()
+                                estado_watchdog["ultimo_archivo"] = time.time()
                             continue
 
                         es_done = "\x1b[2m" in linea_limpia
@@ -888,7 +910,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                             clear_line()
                             if es_done:
                                 contador_done += 1
-                                ultimo_archivo = time.time()
+                                estado_watchdog["ultimo_archivo"] = time.time()
                                 estado_spinner["done"] = contador_done
                                 sys.stdout.write(
                                     f"  {DIM}[{contador_seq:>3}] [DONE] {nombre_visible_str}{RESET}\n"
@@ -906,7 +928,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                                 )
                             else:
                                 contador_nuevo += 1
-                                ultimo_archivo = time.time()
+                                estado_watchdog["ultimo_archivo"] = time.time()
                                 archivos_nuevos.append(linea_pura)
                                 estado_spinner["nuevo"] = contador_nuevo
                                 sys.stdout.write(
@@ -920,6 +942,9 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                     proceso.wait()
                 except OSError:
                     pass
+            estado_watchdog["stop"] = True
+            watch.join(timeout=2)
+            part_watch.join(timeout=2)
             estado_spinner["stop"] = True
             spin.join(timeout=2)
             clear_line()
@@ -941,7 +966,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
             warnings_hilo,
             contador_nuevo,
             contador_done,
-            timeout_ocurrido,
+            estado_watchdog["timeout"],
             int(time.time() - inicio),
             returncode,
         )
@@ -954,7 +979,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
 # EJECUTOR DE URL
 # =============================================================================
 def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
-    nombre = url.rstrip("/").split("/")[-1][:60]
+    nombre = re.sub(r'[\\/*?:"<>|]', "_", url.rstrip("/").split("/")[-1])[:60]
     log_path = PATHS["log_dir"] / f"{nombre}.log"
     PATHS["log_dir"].mkdir(parents=True, exist_ok=True)
     extra_args = []
@@ -971,12 +996,12 @@ def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
                 rangos_skip = post_range.get("skip") or post_range.get("omitir", [])
                 post_range = convertir_skip_a_range(post_range)
                 if post_range:
-                    extra_args = ["--post-range", post_range]
+                    extra_args.extend(["--post-range", post_range])
                     print(
-                        f"  {YELLOW}[RANGE] Descargando posts: {post_range}  (skipeados: {', '.join(map(str, rangos_skip))}){RESET}"
+                        f"  {YELLOW}[RANGE] Descargando posts: {post_range}  (Posts saltados: {', '.join(map(str, rangos_skip))}){RESET}"
                     )
             else:
-                extra_args = ["--post-range", post_range]
+                extra_args.extend(["--post-range", post_range])
                 print(f"  {YELLOW}[RANGE] Descargando posts: {post_range}{RESET}")
 
     if IS_WINDOWS:
@@ -1033,6 +1058,22 @@ def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
         },
         post_range,
         rangos_skip,
+    )
+
+    # Autolimpieza: si la descarga fue exitosa, sacar de posts_fallidos
+    limpiar_fallidos_si_exito(
+        url,
+        {
+            "nombre": nombre,
+            "ok": not timeout and len(errs) == 0,
+            "nuevos": nuevos,
+            "done": done,
+            "errores": len(errs),
+            "warnings": len(warns),
+            "timeout": timeout,
+            "duracion": duracion,
+            "returncode": returncode,
+        },
     )
 
     return {
@@ -1175,9 +1216,32 @@ def main():
         os.path.dirname(os.path.abspath(__file__)), "descarga.running"
     )
 
-    if os.path.exists(CENTINELA):
-        if time.time() - os.path.getmtime(CENTINELA) > 60:
-            os.remove(CENTINELA)
+    def ya_esta_corriendo() -> bool:
+        """Verifica si hay otra instancia viva usando el PID del centinela."""
+        if not os.path.exists(CENTINELA):
+            return False
+        try:
+            with open(CENTINELA, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            # os.kill(pid, 0) verifica si el proceso existe sin matarlo
+            os.kill(pid, 0)
+            return True
+        except (ValueError, OSError, ProcessLookupError):
+            # PID inválido o proceso muerto
+            try:
+                os.remove(CENTINELA)
+            except OSError:
+                pass
+            return False
+
+    if ya_esta_corriendo():
+        print(
+            f"\n  {RED}[X] descarga.py ya está en ejecución (PID en {CENTINELA}).{RESET}"
+        )
+        sys.exit(1)
+
+    with open(CENTINELA, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
 
     # Abrir monitor en split de Windows Terminal
     if IS_WINDOWS and os.environ.get("WT_SESSION"):
@@ -1210,8 +1274,6 @@ def main():
             except OSError:
                 pass
 
-    open(CENTINELA, "w").close()
-
     try:
         if not shutil.which(GDL_CFG["executable"]):
             print(
@@ -1222,12 +1284,13 @@ def main():
                 input(f"  {GRAY}Presiona Enter para salir...{RESET}")
             sys.exit(1)
 
-        state = cargar_estado()
         lista = [
             l.strip()
             for l in PATHS["lista_file"].read_text(encoding="utf-8").splitlines()
             if l.strip() and not l.startswith("#")
         ]
+
+        state = cargar_estado(lista)
 
         batch_size = PIPELINE["batch_size"]
         lote = lista[state["batch_index"] : state["batch_index"] + batch_size]

@@ -14,6 +14,7 @@ from pathlib import Path
 
 IS_WINDOWS = sys.platform == "win32"
 
+
 # =============================================================================
 # CONFIGURACIÓN — leer desde config.json (igual que descarga.py)
 # =============================================================================
@@ -32,9 +33,10 @@ def cargar_rips_dir() -> str:
             pass
     return r"G:\Rips" if IS_WINDOWS else os.path.expanduser("~/Rips")
 
+
 RIPS_DIR = cargar_rips_dir()
 
-VENTANA_ACTIVO = 30   # archivos .part que crecieron en los últimos 30s
+VENTANA_ACTIVO = 30  # archivos .part que crecieron en los últimos 30s
 VENTANA_INACTIVO = 120  # archivos .part que existen pero no crecen (hasta 120s)
 VENTANA_VEL = 3
 
@@ -96,7 +98,7 @@ def get_active_parts(rips_dir):
     inactivos.sort(key=lambda x: x[0], reverse=True)
     return (
         [(r, n, t) for _, r, n, t in activos],
-        [(r, n, t) for _, r, n, t in inactivos]
+        [(r, n, t) for _, r, n, t in inactivos],
     )
 
 
@@ -175,9 +177,6 @@ def main():
     CENTINELA = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "descarga.running"
     )
-    if os.path.exists(CENTINELA):
-        if time.time() - os.path.getmtime(CENTINELA) > 60:
-            os.remove(CENTINELA)
 
     rips_dir = args.rips_dir
     intervalo = args.intervalo
@@ -201,9 +200,22 @@ def main():
     spin_idx = 0
     ultimas_filas = 0
 
+    TIEMPO_MAXIMO_SIN_CENTINELA_NUEVO = 7200  # 2 horas
+
     try:
         while True:
             if not os.path.exists(CENTINELA):
+                break
+
+            # Si el centinela lleva más de 2h sin cambiar, asumimos proceso muerto
+            try:
+                mtime = os.path.getmtime(CENTINELA)
+                if time.time() - mtime > TIEMPO_MAXIMO_SIN_CENTINELA_NUEVO:
+                    print(
+                        f"\n  {GRAY}[MONITOR] Centinela stale detectado (>2h). Cerrando.{RESET}"
+                    )
+                    break
+            except OSError:
                 break
 
             activos, inactivos = get_active_parts(rips_dir)

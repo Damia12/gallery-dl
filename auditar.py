@@ -390,6 +390,23 @@ def analizar_logs():
     purgar_zip_antiguos(dias=60)
     imprimir_reporte(conteo, huerfanos, len(logs_a_comprimir))
 
+    # Aviso de posts_fallidos.json si existe
+    pf_path = os.path.join(os.path.dirname(AUDIT_CSV), "posts_fallidos.json")
+    if os.path.exists(pf_path):
+        try:
+            with open(pf_path, "r", encoding="utf-8") as f:
+                fallidos = json.load(f)
+            total = sum(len(v.get("skip", [])) for v in fallidos.values())
+            if total:
+                print(
+                    f"  {YELLOW}⚠️  Revisar posts_fallidos.json: {total} post(s) sugerido(s) en {len(fallidos)} URL(s){RESET}"
+                )
+                print(
+                    f"  {GRAY}   Copiar manualmente a skip_posts.json para aplicar{RESET}\n"
+                )
+        except Exception:
+            pass
+
 
 # =============================================================================
 # REPORTE VISUAL
