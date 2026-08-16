@@ -3,6 +3,7 @@ venv/
 __pycache__/
 *.pyc
 skip_posts.json
+posts_fallidos.json
 state.json
 archive.db
 *.log
