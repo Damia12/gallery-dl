@@ -58,6 +58,7 @@ KEYWORDS_RUIDO = [
 TIMEOUT_ACTIVIDAD = 900
 TIMEOUT_ACTIVIDAD_LENTO = 7200  # 2 horas para Bunkr / Simpcity
 TIMEOUT_SIN_ARCHIVOS = 1800
+TIMEOUT_SIN_ARCHIVOS_LENTO = 3600  # 1 hora para Bunkr / Simpcity
 SLEEP_ENTRE_URLS = 10
 
 
@@ -252,22 +253,52 @@ def detectar_y_reportar_fallidos(
     post_range: str | None,
     rangos_skip_previos: list | None,
 ):
-    """Detecta posts candidatos a fallidos y guarda en posts_fallidos.json como reporte."""
+    """Detecta posts candidatos a fallidos y guarda en posts_fallidos.json como reporte.
+
+    Cambios v2.1:
+    - Nuevo estado "timeout_parcial": timeout con archivos descargados antes del crash
+    - Reporta URLs sin post_range con marcador "revisar" para revision manual
+    """
     fallidos = cargar_posts_fallidos()
     url_key = url.rstrip("/")
 
-    # Solo reportar si hay timeout total o fatal
-    if res["timeout"] and res["nuevos"] == 0:
-        estado = "timeout_atascado"
+    # Determinar estado del fallo
+    if res["timeout"]:
+        if res["nuevos"] == 0:
+            estado = "timeout_atascado"
+        else:
+            estado = "timeout_parcial"
     elif res["errores"] > 0 and res["returncode"] != 0:
         estado = "fatal"
     else:
-        return  # No reportar nada si hubo progreso o está OK
+        return  # No reportar nada si está OK
 
     posts_intentados = extraer_posts_desde_range(post_range)
+
+    # CASO A: Sin post_range pero hay fallo -> reportar con marcador "revisar"
     if not posts_intentados:
+        if estado in ("timeout_atascado", "timeout_parcial", "fatal"):
+            if url_key not in fallidos:
+                fallidos[url_key] = {
+                    "skip": ["revisar"],
+                    "razon": estado,
+                    "fecha": datetime.now().strftime("%Y-%m-%d"),
+                    "intentos": 0,
+                    "nota": "Sin post_range configurado. Revisar log manualmente.",
+                }
+            else:
+                fallidos[url_key]["razon"] = estado
+                fallidos[url_key]["fecha"] = datetime.now().strftime("%Y-%m-%d")
+                fallidos[url_key]["intentos"] = fallidos[url_key].get("intentos", 0) + 1
+
+            guardar_posts_fallidos(fallidos)
+            print(
+                f"  {YELLOW}[FALLIDOS] URL marcada para revision manual — "
+                f"revisar posts_fallidos.json{RESET}"
+            )
         return
 
+    # CASO B: Con post_range -> reportar posts especificos como antes
     ya_skipeados = set()
     if rangos_skip_previos:
         ya_skipeados.update(rangos_skip_previos)
@@ -327,12 +358,20 @@ def limpiar_fallidos_si_exito(url: str, res: dict):
         )
 
 
-def obtener_timeout_por_url(url: str) -> int:
-    """Devuelve timeout largo para sitios que suelen tardar mucho (Bunkr, Simpcity)."""
+def es_host_lento(url: str) -> bool:
+    """Bunkr / Simpcity: sitios que suelen tardar mucho o tener rate-limit agresivo."""
     u = url.lower()
-    if any(x in u for x in ["bunkr", "bunkrr", "simpcity"]):
-        return TIMEOUT_ACTIVIDAD_LENTO
-    return TIMEOUT_ACTIVIDAD
+    return any(x in u for x in ["bunkr", "bunkrr", "simpcity"])
+
+
+def obtener_timeout_por_url(url: str) -> int:
+    """Devuelve timeout largo (sin output) para sitios lentos."""
+    return TIMEOUT_ACTIVIDAD_LENTO if es_host_lento(url) else TIMEOUT_ACTIVIDAD
+
+
+def obtener_timeout_sin_archivos_por_url(url: str) -> int:
+    """Igual que obtener_timeout_por_url, pero para el reloj de archivos nuevos."""
+    return TIMEOUT_SIN_ARCHIVOS_LENTO if es_host_lento(url) else TIMEOUT_SIN_ARCHIVOS
 
 
 # =============================================================================
@@ -498,7 +537,7 @@ def parsear_progreso(linea_pura: str) -> dict | None:
 # =============================================================================
 # WATCHDOG
 # =============================================================================
-def watchdog_thread(proceso, estado, timeout):
+def watchdog_thread(proceso, estado, timeout, timeout_sin_archivos):
     while not estado["stop"]:
         ahora = time.time()
         if ahora - estado["ultimo_output"] > timeout:
@@ -508,7 +547,7 @@ def watchdog_thread(proceso, estado, timeout):
                 pass
             estado["timeout"] = True
             break
-        if ahora - estado["ultimo_archivo"] > TIMEOUT_SIN_ARCHIVOS:
+        if ahora - estado["ultimo_archivo"] > timeout_sin_archivos:
             try:
                 proceso.kill()
             except OSError:
@@ -623,7 +662,12 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
         )
         watch = threading.Thread(
             target=watchdog_thread,
-            args=(proceso, estado_watchdog, obtener_timeout_por_url(url)),
+            args=(
+                proceso,
+                estado_watchdog,
+                obtener_timeout_por_url(url),
+                obtener_timeout_sin_archivos_por_url(url),
+            ),
             daemon=True,
         )
         stderr_thr = threading.Thread(target=leer_stderr, daemon=True)
@@ -758,6 +802,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
         buffer = ""
         estado_watchdog["ultimo_output"] = time.time()
         timeout_val = obtener_timeout_por_url(url)
+        timeout_sin_archivos_val = obtener_timeout_sin_archivos_por_url(url)
 
         try:
             master_fd, slave_fd = pty.openpty()
@@ -768,7 +813,12 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
 
             watch = threading.Thread(
                 target=watchdog_thread,
-                args=(proceso, estado_watchdog, obtener_timeout_por_url(url)),
+                args=(
+                    proceso,
+                    estado_watchdog,
+                    timeout_val,
+                    timeout_sin_archivos_val,
+                ),
                 daemon=True,
             )
             watch.start()
@@ -785,7 +835,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                             pass
                         estado_watchdog["timeout"] = True
                         break
-                    if ahora - estado_watchdog["ultimo_archivo"] > TIMEOUT_SIN_ARCHIVOS:
+                    if ahora - estado_watchdog["ultimo_archivo"] > timeout_sin_archivos_val:
                         try:
                             proceso.kill()
                         except OSError:
@@ -1158,7 +1208,40 @@ def procesar_lote(lote: list):
         )
         print(f"  {GRAY}{url}{RESET}\n")
 
-        res = ejecutar_url(url, skip_posts=skip_posts)
+        try:
+            res = ejecutar_url(url, skip_posts=skip_posts)
+        except Exception as e:
+            nombre_err = url.rstrip("/").split("/")[-1][:60]
+            print(
+                f"\n  {RED}[X] Excepcion no controlada procesando {nombre_err}: {e}{RESET}"
+            )
+            print(
+                f"  {DIM}(se registra como fallida y el lote continua con la siguiente URL){RESET}"
+            )
+            try:
+                PATHS["log_dir"].mkdir(parents=True, exist_ok=True)
+                log_path = PATHS["log_dir"] / f"{nombre_err}.log"
+                with open(log_path, "a", encoding="utf-8") as lf:
+                    lf.write(
+                        f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"URL: {url}\nEXCEPCION: {e}\n"
+                        f'[RESUMEN] nombre_modelo="{nombre_err}" url="{url}" '
+                        f'nuevos="0" ya_descargados="0" errores="1" warnings="0" '
+                        f'duracion="0" returncode="-1" timeout="false" '
+                        f'post_range="none"\n' + "=" * 60 + "\n\n"
+                    )
+            except OSError:
+                pass
+            res = {
+                "nombre": nombre_err,
+                "nuevos": 0,
+                "done": 0,
+                "errores": 1,
+                "warnings": 0,
+                "timeout": False,
+                "duracion": 0,
+                "returncode": -1,
+            }
         _imprimir_resumen_url(res)
 
         totales["nuevos"] += res["nuevos"]
@@ -1234,6 +1317,29 @@ def main():
                 pass
             return False
 
+    def iniciar_heartbeat(intervalo: int = 60) -> threading.Event:
+        """Refresca el mtime de CENTINELA cada `intervalo` segundos.
+
+        Sin esto, el mtime queda congelado desde el arranque del proceso.
+        El chequeo de stale en monitor.py (2h) terminaba disparando por
+        simple paso del tiempo -- no por inactividad real -- en lotes
+        largos o con hilos de bunkr/simpcity que ya de por si pueden
+        tardar hasta 2h. Con el heartbeat, el monitor solo se cierra por
+        stale si descarga.py de verdad dejo de responder.
+        """
+        detener = threading.Event()
+
+        def _tick():
+            while not detener.is_set():
+                try:
+                    os.utime(CENTINELA, None)
+                except OSError:
+                    pass
+                detener.wait(intervalo)
+
+        threading.Thread(target=_tick, daemon=True).start()
+        return detener
+
     if ya_esta_corriendo():
         print(
             f"\n  {RED}[X] descarga.py ya está en ejecución (PID en {CENTINELA}).{RESET}"
@@ -1242,6 +1348,7 @@ def main():
 
     with open(CENTINELA, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
+    heartbeat_stop = iniciar_heartbeat()
 
     # Abrir monitor en split de Windows Terminal
     if IS_WINDOWS and os.environ.get("WT_SESSION"):
@@ -1324,6 +1431,7 @@ def main():
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
     finally:
+        heartbeat_stop.set()
         if os.path.exists(CENTINELA):
             os.remove(CENTINELA)
 

@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-monitor.py — Muestra en tiempo real todos los .part activos en G:/Rips
+monitor.py — Muestra en tiempo real archivos .part activos en G:/Rips
 Uso: python monitor.py [--rips-dir G:/Rips] [--intervalo 1]
+
+v2.3 — Simplificado: solo muestra archivos creciendo AHORA (<=5s).
+       Elimina estados inactivo/stale para evitar acumulación visual.
+       Vuelve al comportamiento de la versión original que funcionaba.
 """
 
 import argparse
@@ -16,7 +20,7 @@ IS_WINDOWS = sys.platform == "win32"
 
 
 # =============================================================================
-# CONFIGURACIÓN — leer desde config.json (igual que descarga.py)
+# CONFIGURACIÓN
 # =============================================================================
 def cargar_rips_dir() -> str:
     script_dir = Path(__file__).parent
@@ -31,13 +35,12 @@ def cargar_rips_dir() -> str:
                 return os.path.expandvars(os.path.expanduser(raw))
         except (json.JSONDecodeError, KeyError):
             pass
-    return r"G:\Rips" if IS_WINDOWS else os.path.expanduser("~/Rips")
+    return r"G:\\Rips" if IS_WINDOWS else os.path.expanduser("~/Rips")
 
 
 RIPS_DIR = cargar_rips_dir()
 
-VENTANA_ACTIVO = 30  # archivos .part que crecieron en los últimos 30s
-VENTANA_INACTIVO = 120  # archivos .part que existen pero no crecen (hasta 120s)
+VENTANA_ACTIVO = 5  # solo archivos .part que crecieron en los últimos 5s
 VENTANA_VEL = 3
 
 RESET = "\033[0m"
@@ -77,29 +80,26 @@ def fmt_bytes(b):
 
 
 def get_active_parts(rips_dir):
-    """Escanea recursivamente archivos .part y los clasifica en activos/inactivos."""
+    """Devuelve lista de archivos .part que crecieron en los últimos 5s.
+
+    v2.3: Vuelve al comportamiento original — solo archivos activos.
+    Si un archivo se detiene por más de 5s, desaparece del monitor.
+    Cuando vuelve a crecer, aparece de nuevo como una línea nueva.
+    """
     ahora = time.time()
-    activos = []
-    inactivos = []
+    candidatos = []
     for root, _, files in os.walk(rips_dir):
         for fname in files:
             if fname.endswith(".part"):
                 ruta = os.path.join(root, fname)
                 try:
                     st = os.stat(ruta)
-                    age = ahora - st.st_mtime
-                    if age <= VENTANA_ACTIVO:
-                        activos.append((st.st_mtime, ruta, fname, st.st_size))
-                    elif age <= VENTANA_INACTIVO:
-                        inactivos.append((st.st_mtime, ruta, fname, st.st_size))
+                    if (ahora - st.st_mtime) <= VENTANA_ACTIVO:
+                        candidatos.append((st.st_mtime, ruta, fname, st.st_size))
                 except OSError:
                     pass
-    activos.sort(key=lambda x: x[0], reverse=True)
-    inactivos.sort(key=lambda x: x[0], reverse=True)
-    return (
-        [(r, n, t) for _, r, n, t in activos],
-        [(r, n, t) for _, r, n, t in inactivos],
-    )
+    candidatos.sort(key=lambda x: x[0], reverse=True)
+    return [(r, n, t) for _, r, n, t in candidatos]
 
 
 def ruta_corta(ruta_completa, rips_dir, maxlen=60):
@@ -110,18 +110,20 @@ def ruta_corta(ruta_completa, rips_dir, maxlen=60):
 HEADER_LINES = 5
 
 
-def dibujar_panel(activos, inactivos, historiales, spin_idx, rips_dir, ultimas_filas):
+def dibujar_panel(activos, historiales, spin_idx, rips_dir, ultimas_filas):
+    """Dibuja el panel de archivos .part activos.
+
+    v2.3: Simplificado — solo estado "activo". Sin inactivo/stale.
+    """
     ahora = time.monotonic()
     lineas = []
 
-    if not activos and not inactivos:
+    if not activos:
         lineas.append(f"  {GRAY}Sin descarga activa — esperando .part...{RESET}")
         lineas.append("")
     else:
-        # Activos (creciendo)
         for ruta, nombre, tamanio in activos:
             rel = ruta_corta(ruta, rips_dir)
-            # FIX: clave por ruta completa, no por nombre base
             hist = historiales.get(ruta, deque())
 
             hist.append((ahora, tamanio))
@@ -143,15 +145,6 @@ def dibujar_panel(activos, inactivos, historiales, spin_idx, rips_dir, ultimas_f
             lineas.append(f"  {GRAY}📄{RESET} {YELLOW}{rel}{RESET}")
             lineas.append(
                 f"  {color}{spin}{RESET}  {BOLD}{fmt_bytes(tamanio)}{RESET} descargados   {color}{vel_str}{RESET}"
-            )
-            lineas.append("")
-
-        # Inactivos recientes (sin crecer, pero existen)
-        for ruta, nombre, tamanio in inactivos:
-            rel = ruta_corta(ruta, rips_dir)
-            lineas.append(f"  {GRAY}📄 {rel}{RESET}")
-            lineas.append(
-                f"  {GRAY}⏸  {fmt_bytes(tamanio)} descargados   inactivo reciente{RESET}"
             )
             lineas.append("")
 
@@ -196,21 +189,23 @@ def main():
     print(f"{CYAN}{BOLD}  {'═' * 58}{RESET}")
     sys.stdout.flush()
 
-    historiales = {}  # FIX: clave = ruta completa, no nombre base
+    historiales = {}  # clave = ruta completa
     spin_idx = 0
     ultimas_filas = 0
 
     TIEMPO_MAXIMO_SIN_CENTINELA_NUEVO = 7200  # 2 horas
+
+    motivo_cierre = "normal"
 
     try:
         while True:
             if not os.path.exists(CENTINELA):
                 break
 
-            # Si el centinela lleva más de 2h sin cambiar, asumimos proceso muerto
             try:
                 mtime = os.path.getmtime(CENTINELA)
                 if time.time() - mtime > TIEMPO_MAXIMO_SIN_CENTINELA_NUEVO:
+                    motivo_cierre = "stale"
                     print(
                         f"\n  {GRAY}[MONITOR] Centinela stale detectado (>2h). Cerrando.{RESET}"
                     )
@@ -218,21 +213,22 @@ def main():
             except OSError:
                 break
 
-            activos, inactivos = get_active_parts(rips_dir)
+            activos = get_active_parts(rips_dir)
 
-            # FIX: usar ruta completa como clave para evitar colisiones
-            todas_rutas = {r for r, _, _ in activos + inactivos}
-
-            for ruta in todas_rutas:
+            # FIX: clave = ruta completa, no nombre base — debe coincidir con
+            # el historiales.get(ruta, ...) de dibujar_panel, si no, el
+            # historial nunca se encuentra y la velocidad nunca se calcula.
+            rutas_activas = {r for r, _, _ in activos}
+            for ruta, _, _ in activos:
                 if ruta not in historiales:
                     historiales[ruta] = deque()
 
-            for ruta in list(historiales):
-                if ruta not in todas_rutas:
-                    del historiales[ruta]
+            for r in list(historiales):
+                if r not in rutas_activas:
+                    del historiales[r]
 
             ultimas_filas = dibujar_panel(
-                activos, inactivos, historiales, spin_idx, rips_dir, ultimas_filas
+                activos, historiales, spin_idx, rips_dir, ultimas_filas
             )
             spin_idx += 1
             time.sleep(intervalo)
@@ -242,8 +238,18 @@ def main():
     finally:
         show_cursor()
         goto(HEADER_LINES + ultimas_filas + 2)
-        print(f"{GRAY}  Descarga terminada. Cerrando monitor...{RESET}\n")
-        time.sleep(1)
+        if motivo_cierre == "stale":
+            print(
+                f"{YELLOW}  [!] El monitor se cerro porque descarga.running no se "
+                f"actualizo en 2h (posible proceso colgado o cerrado a la fuerza).{RESET}"
+            )
+            print(
+                f"{GRAY}  Revisa si descarga.py sigue vivo y el ultimo log en Rips/logs.{RESET}\n"
+            )
+            time.sleep(6)
+        else:
+            print(f"{GRAY}  Descarga terminada. Cerrando monitor...{RESET}\n")
+            time.sleep(1)
 
 
 if __name__ == "__main__":
