@@ -325,7 +325,11 @@ def detectar_y_reportar_fallidos(
     """
     fallidos = cargar_posts_fallidos()
     url_key = url.rstrip("/")
-    thread_id = extraer_thread_id(url)
+    resultado_thread = extraer_thread_id(url)
+    if resultado_thread:
+        thread_id, dominio = resultado_thread
+    else:
+        thread_id, dominio = None, extraer_dominio(url)
 
     # Determinar estado del fallo
     if res["timeout"]:
@@ -340,7 +344,7 @@ def detectar_y_reportar_fallidos(
     # -------------------------------------------------------------------------
     if post_id_activo is not None:
         post_url = (
-            f"https://simpcity.su/threads/{thread_id}/post-{post_id_activo}"
+            f"https://{dominio}/threads/{thread_id}/post-{post_id_activo}"
             if thread_id
             else None
         )
@@ -768,21 +772,15 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
                 es_err = not es_warn and es_linea_error(linea_strip)
                 if not es_warn and not es_err:
                     continue
+                # No se imprime en terminal — solo se cuenta y queda
+                # registrado en el .log del hilo (ver posts_fallidos.json
+                # para el link directo al post fallido).
                 with lock_print:
                     estado_watchdog["ultimo_output"] = time.time()
-                    contador["seq"] += 1
-                    clear_line()
                     if es_warn:
                         warnings_hilo.append(linea_strip)
-                        sys.stdout.write(
-                            f"  {YELLOW}[{contador['seq']:>3}] [!] {limpiar_error(linea_strip)}{RESET}\n"
-                        )
                     else:
                         errores_hilo.append(linea_strip)
-                        sys.stdout.write(
-                            f"  {RED}[{contador['seq']:>3}] [X] {limpiar_error(linea_strip)}{RESET}\n"
-                        )
-                    sys.stdout.flush()
 
         spin = threading.Thread(
             target=spinner_thread, args=(estado_spinner, lock_print), daemon=True
@@ -1103,7 +1101,6 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                             if carpeta_visible
                             else archivo_visible
                         )
-                        contador_seq += 1
 
                         with lock_print:
                             estado_spinner["pct"] = -1
@@ -1112,34 +1109,36 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                             estado_spinner["speed"] = ""
                             estado_spinner["ultima_linea"] = ""
 
-                            clear_line()
                             if es_done:
+                                contador_seq += 1
                                 contador_done += 1
                                 estado_watchdog["ultimo_archivo"] = time.time()
                                 estado_spinner["done"] = contador_done
+                                clear_line()
                                 sys.stdout.write(
                                     f"  {DIM}[{contador_seq:>3}] [DONE] {nombre_visible_str}{RESET}\n"
                                 )
+                                sys.stdout.flush()
                             elif es_warning:
+                                # No se imprime en terminal — solo se cuenta y
+                                # queda registrado en el .log del hilo.
                                 contador_warnings += 1
                                 warnings_hilo.append(linea_pura)
-                                sys.stdout.write(
-                                    f"  {YELLOW}[{contador_seq:>3}] [!] {limpiar_error(linea_pura)}{RESET}\n"
-                                )
                             elif es_error:
+                                # No se imprime en terminal — solo se cuenta y
+                                # queda registrado en el .log del hilo.
                                 errores_hilo.append(linea_pura)
-                                sys.stdout.write(
-                                    f"  {RED}[{contador_seq:>3}] [X] {limpiar_error(linea_pura)}{RESET}\n"
-                                )
                             else:
+                                contador_seq += 1
                                 contador_nuevo += 1
                                 estado_watchdog["ultimo_archivo"] = time.time()
                                 archivos_nuevos.append(linea_pura)
                                 estado_spinner["nuevo"] = contador_nuevo
+                                clear_line()
                                 sys.stdout.write(
                                     f"  {GREEN}[{contador_seq:>3}] {nombre_visible_str}{RESET}\n"
                                 )
-                            sys.stdout.flush()
+                                sys.stdout.flush()
 
         finally:
             if proceso is not None:
