@@ -44,11 +44,6 @@ RE_PROGRESS = re.compile(
     re.IGNORECASE,
 )
 
-# Regex para capturar post_id desde logs de gallery-dl (parent-metadata)
-# Ej: [bunkr][debug] post 3309088: Using archive...
-RE_POST_ID = re.compile(r"\[([^\]]+)\]\[(?:debug|info|warning|error)\] post (\d+): ")
-RE_LOG_LINE = re.compile(r"^\[[^\]]+\]\[(?:debug|info|warning|error)\]")
-
 KEYWORDS_WARNING = ["warning", "rate limit", "sleeping", "skipping"]
 KEYWORDS_ERROR = ["error", "failed", "unsupported", "unable", "exception"]
 KEYWORDS_RUIDO = [
@@ -225,61 +220,6 @@ def guardar_posts_fallidos(data: dict):
         print(f"  {YELLOW}[!] No se pudo guardar posts_fallidos.json: {e}{RESET}")
 
 
-def purgar_posts_fallidos(dias: int = 7, min_intentos: int = 3):
-    """Elimina entradas antiguas de posts_fallidos.json.
-
-    Reglas:
-    - Si intentos < min_intentos Y fecha > dias -> eliminar.
-    - Si intentos >= min_intentos -> conservar (fallo crónico).
-    """
-    pf_path = obtener_posts_fallidos_path()
-    if not pf_path.exists():
-        return
-
-    fallidos = cargar_posts_fallidos()
-    if not fallidos:
-        return
-
-    ahora = datetime.now()
-    eliminados = 0
-
-    for url_key in list(fallidos.keys()):
-        entrada = fallidos[url_key]
-        intentos = entrada.get("intentos", 0)
-        fecha_str = entrada.get("fecha", "")
-
-        # Conservar crónicos (muchas fallas)
-        if intentos >= min_intentos:
-            continue
-
-        try:
-            fecha = datetime.strptime(fecha_str, "%Y-%m-%d")
-            dias_diff = (ahora - fecha).days
-            if dias_diff >= dias:
-                del fallidos[url_key]
-                eliminados += 1
-        except (ValueError, TypeError):
-            # Fecha inválida, eliminar por seguridad
-            del fallidos[url_key]
-            eliminados += 1
-
-    if eliminados:
-        guardar_posts_fallidos(fallidos)
-        print(
-            f"  {GRAY}[PURGA] {eliminados} entrada(s) antigua(s) eliminada(s) "
-            f"de posts_fallidos.json{RESET}"
-        )
-
-
-def extraer_dominio(url: str) -> str:
-    """
-    Extrae el dominio de una URL de hilo Simpcity/XenForo.
-    Ej: 'https://simpcity.cr/threads/1709203' → 'simpcity.cr'
-    """
-    match = re.match(r"https?://([^/]+)", url)
-    return match.group(1) if match else "simpcity.cr"  # fallback conservador
-
-
 def extraer_posts_desde_range(post_range: str | None) -> set:
     """Extrae los posts numéricos de un string de post-range."""
     posts = set()
@@ -312,77 +252,30 @@ def detectar_y_reportar_fallidos(
     res: dict,
     post_range: str | None,
     rangos_skip_previos: list | None,
-    post_id_activo: int | None = None,
 ):
     """Detecta posts candidatos a fallidos y guarda en posts_fallidos.json como reporte.
 
-    Cambios v3.0:
-    - Captura post_id real desde logs de gallery-dl (parent-metadata)
-    - Construye link directo al post de XenForo
-    - Alerta crítica cuando una URL acumula ≥3 fallos
+    Cambios v2.1:
     - Nuevo estado "timeout_parcial": timeout con archivos descargados antes del crash
     - Reporta URLs sin post_range con marcador "revisar" para revision manual
     """
     fallidos = cargar_posts_fallidos()
     url_key = url.rstrip("/")
-    thread_id = extraer_thread_id(url)
 
     # Determinar estado del fallo
     if res["timeout"]:
-        estado = "timeout_atascado" if res["nuevos"] == 0 else "timeout_parcial"
+        if res["nuevos"] == 0:
+            estado = "timeout_atascado"
+        else:
+            estado = "timeout_parcial"
     elif res["errores"] > 0 and res["returncode"] != 0:
         estado = "fatal"
     else:
         return  # No reportar nada si está OK
 
-    # -------------------------------------------------------------------------
-    # CASO PRIORITARIO: post_id real capturado desde logs (parent-metadata)
-    # -------------------------------------------------------------------------
-    if post_id_activo is not None:
-        post_url = (
-            f"https://simpcity.su/threads/{thread_id}/post-{post_id_activo}"
-            if thread_id
-            else None
-        )
-
-        if url_key not in fallidos:
-            fallidos[url_key] = {
-                "skip": [post_id_activo],
-                "post_id": post_id_activo,
-                "post_url": post_url,
-                "razon": estado,
-                "fecha": datetime.now().strftime("%Y-%m-%d"),
-                "intentos": 1,
-            }
-        else:
-            existing = set(fallidos[url_key].get("skip", []))
-            existing.add(post_id_activo)
-            fallidos[url_key]["skip"] = sorted(existing)
-            fallidos[url_key]["post_id"] = post_id_activo
-            fallidos[url_key]["post_url"] = post_url
-            fallidos[url_key]["razon"] = estado
-            fallidos[url_key]["fecha"] = datetime.now().strftime("%Y-%m-%d")
-            fallidos[url_key]["intentos"] = fallidos[url_key].get("intentos", 0) + 1
-
-        intentos = fallidos[url_key].get("intentos", 0)
-        if intentos >= 3:
-            print(
-                f"  {RED}[ALERTA CRÍTICA] URL con {intentos} fallos acumulados — "
-                f"revisar manualmente{RESET}"
-            )
-
-        guardar_posts_fallidos(fallidos)
-        url_msg = f" — {post_url}" if post_url else ""
-        print(
-            f"  {YELLOW}[FALLIDOS] Post {post_id_activo} marcado como fallido"
-            f"{url_msg}{RESET}"
-        )
-        return
-
-    # -------------------------------------------------------------------------
-    # CASO A: Sin post_range pero hay fallo -> reportar con marcador "revisar"
-    # -------------------------------------------------------------------------
     posts_intentados = extraer_posts_desde_range(post_range)
+
+    # CASO A: Sin post_range pero hay fallo -> reportar con marcador "revisar"
     if not posts_intentados:
         if estado in ("timeout_atascado", "timeout_parcial", "fatal"):
             if url_key not in fallidos:
@@ -405,9 +298,7 @@ def detectar_y_reportar_fallidos(
             )
         return
 
-    # -------------------------------------------------------------------------
-    # CASO B: Con post_range -> reportar posts especificos como antes (fallback)
-    # -------------------------------------------------------------------------
+    # CASO B: Con post_range -> reportar posts especificos como antes
     ya_skipeados = set()
     if rangos_skip_previos:
         ya_skipeados.update(rangos_skip_previos)
@@ -481,18 +372,6 @@ def obtener_timeout_por_url(url: str) -> int:
 def obtener_timeout_sin_archivos_por_url(url: str) -> int:
     """Igual que obtener_timeout_por_url, pero para el reloj de archivos nuevos."""
     return TIMEOUT_SIN_ARCHIVOS_LENTO if es_host_lento(url) else TIMEOUT_SIN_ARCHIVOS
-
-
-def extraer_thread_id(url: str) -> tuple[str, str] | None:
-    """
-    Ahora devuelve (thread_id, dominio) para propagar el dominio real.
-    """
-    match = re.search(r"/threads/[^.]+\.(\d+)", url)
-    if match:
-        thread_id = match.group(1)
-        dominio = extraer_dominio(url)
-        return thread_id, dominio
-    return None
 
 
 # =============================================================================
@@ -719,7 +598,6 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
     archivos_nuevos = []
     errores_hilo = []
     warnings_hilo = []
-    post_id_activo = None
     lock_print = threading.Lock()
     contador = {"seq": 0}
 
@@ -755,15 +633,10 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
         )
 
         def leer_stderr():
-            nonlocal post_id_activo
             for linea in proceso.stderr:
                 linea_strip = ANSI_ESCAPE.sub("", linea).strip()
                 if not linea_strip:
                     continue
-                # Capturar post_id desde logs de gallery-dl
-                m = RE_POST_ID.search(linea_strip)
-                if m:
-                    post_id_activo = int(m.group(2))
                 es_warn = es_linea_warning(linea_strip)
                 es_err = not es_warn and es_linea_error(linea_strip)
                 if not es_warn and not es_err:
@@ -815,15 +688,6 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
                 if not linea_strip:
                     continue
 
-                # Capturar post_id si aparece en stdout (defensivo)
-                m = RE_POST_ID.search(linea_strip)
-                if m:
-                    post_id_activo = int(m.group(2))
-
-                # Filtrar líneas de log puro para que no cuenten como archivos
-                if RE_LOG_LINE.search(linea_strip):
-                    continue
-
                 with lock_print:
                     estado_watchdog["ultimo_output"] = time.time()
                     estado_watchdog["ultimo_archivo"] = time.time()
@@ -870,7 +734,6 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
             estado_watchdog["timeout"],
             int(time.time() - inicio),
             returncode,
-            post_id_activo,
         )
     finally:
         sys.stdout.write("\033[?25h")
@@ -890,7 +753,6 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
     archivos_nuevos = []
     errores_hilo = []
     warnings_hilo = []
-    post_id_activo = None
     contador_nuevo = 0
     contador_done = 0
     contador_warnings = 0
@@ -1075,20 +937,6 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                             continue
                         ultima_ruta = linea_pura
 
-                        # Capturar post_id real desde logs de gallery-dl
-                        m = RE_POST_ID.search(linea_pura)
-                        if m:
-                            post_id_activo = int(m.group(2))
-
-                        # Si es una línea de log puro (no warning/error/done), ignorar
-                        if (
-                            RE_LOG_LINE.search(linea_pura)
-                            and not es_done
-                            and not es_warning
-                            and not es_error
-                        ):
-                            continue
-
                         nombre_sin_prefijo = (
                             RE_PREFIJO_NUM.sub("", linea_pura)
                             if RE_PREFIJO_NUM.match(linea_pura)
@@ -1174,7 +1022,6 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
             estado_watchdog["timeout"],
             int(time.time() - inicio),
             returncode,
-            post_id_activo,
         )
     finally:
         sys.stdout.write("\033[?25h")
@@ -1211,29 +1058,13 @@ def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
                 print(f"  {YELLOW}[RANGE] Descargando posts: {post_range}{RESET}")
 
     if IS_WINDOWS:
-        (
-            archivos,
-            errs,
-            warns,
-            nuevos,
-            done,
-            timeout,
-            duracion,
-            returncode,
-            post_id_activo,
-        ) = descargar_windows(url, nombre, extra_args)
+        archivos, errs, warns, nuevos, done, timeout, duracion, returncode = (
+            descargar_windows(url, nombre, extra_args)
+        )
     else:
-        (
-            archivos,
-            errs,
-            warns,
-            nuevos,
-            done,
-            timeout,
-            duracion,
-            returncode,
-            post_id_activo,
-        ) = descargar_linux(url, nombre, extra_args)
+        archivos, errs, warns, nuevos, done, timeout, duracion, returncode = (
+            descargar_linux(url, nombre, extra_args)
+        )
     # Deduplicar archivos (gallery-dl puede listar duplicados en stdout)
     archivos_unicos = list(dict.fromkeys(archivos))
     archivos = archivos_unicos
@@ -1280,7 +1111,6 @@ def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
         },
         post_range,
         rangos_skip,
-        post_id_activo=post_id_activo,
     )
 
     # Autolimpieza: si la descarga fue exitosa, sacar de posts_fallidos
@@ -1522,9 +1352,6 @@ def main():
     with open(CENTINELA, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
     heartbeat_stop = iniciar_heartbeat()
-
-    # Purgar posts fallidos antiguos al inicio de cada ejecución
-    purgar_posts_fallidos()
 
     # Abrir monitor en split de Windows Terminal
     if IS_WINDOWS and os.environ.get("WT_SESSION"):
