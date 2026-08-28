@@ -3,15 +3,18 @@
 monitor.py — Muestra en tiempo real archivos .part activos en G:/Rips
 Uso: python monitor.py [--rips-dir G:/Rips] [--intervalo 1]
 
-v2.3 — Simplificado: solo muestra archivos creciendo AHORA (<=5s).
-       Elimina estados inactivo/stale para evitar acumulación visual.
-       Vuelve al comportamiento de la versión original que funcionaba.
+v3.0 — Híbrido: watchdog (eventos push) para rutas locales, polling (os.walk) fallback.
+       Auto-detecta si la ruta es local o remota (NAS/SMB).
+       Si watchdog no está instalado, cae graceful a polling.
+       Si la ruta es de red, usa polling directamente.
 """
 
 import argparse
 import json
 import os
+import re
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -51,6 +54,7 @@ YELLOW = "\033[33m"
 GREEN = "\033[32m"
 GRAY = "\033[90m"
 RED = "\033[31m"
+MAGENTA = "\033[35m"
 CLEAR = "\033[2K"
 SPINNERS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -79,42 +83,265 @@ def fmt_bytes(b):
     return f"{b} B"
 
 
-def get_active_parts(rips_dir):
-    """Devuelve lista de archivos .part que crecieron en los últimos 5s.
-
-    v2.3: Vuelve al comportamiento original — solo archivos activos.
-    Si un archivo se detiene por más de 5s, desaparece del monitor.
-    Cuando vuelve a crecer, aparece de nuevo como una línea nueva.
-    """
-    ahora = time.time()
-    candidatos = []
-    for root, _, files in os.walk(rips_dir):
-        for fname in files:
-            if fname.endswith(".part"):
-                ruta = os.path.join(root, fname)
-                try:
-                    st = os.stat(ruta)
-                    if (ahora - st.st_mtime) <= VENTANA_ACTIVO:
-                        candidatos.append((st.st_mtime, ruta, fname, st.st_size))
-                except OSError:
-                    pass
-    candidatos.sort(key=lambda x: x[0], reverse=True)
-    return [(r, n, t) for _, r, n, t in candidatos]
-
-
 def ruta_corta(ruta_completa, rips_dir, maxlen=60):
     rel = ruta_completa.replace(rips_dir, "").lstrip("\\/")
     return ("..." + rel[-(maxlen - 3) :]) if len(rel) > maxlen else rel
 
 
-HEADER_LINES = 5
+# =============================================================================
+# AUTO-DETECCIÓN: ¿Ruta local o remota?
+# =============================================================================
+def es_ruta_local(ruta: str) -> bool:
+    r"""
+    Detecta si una ruta apunta a un filesystem local o remoto (NAS/SMB/NFS).
 
+    Windows:
+      - UNC paths (\\servidor\carpeta) → remoto
+      - Unidades mapeadas (Z:) que apuntan a red → remoto
+      - Unidades fijas locales (C:, D:, G:) → local
 
-def dibujar_panel(activos, historiales, spin_idx, rips_dir, ultimas_filas):
-    """Dibuja el panel de archivos .part activos.
-
-    v2.3: Simplificado — solo estado "activo". Sin inactivo/stale.
+    Linux:
+      - Consulta /proc/mounts para detectar nfs, cifs, fuse, sshfs
+      - Rutas en /tmp, /home, etc. locales → local
     """
+    ruta = os.path.normpath(os.path.expandvars(os.path.expanduser(ruta)))
+
+    if IS_WINDOWS:
+        # UNC path: siempre remoto
+        if ruta.startswith("\\\\"):
+            return False
+
+        # Letra de unidad: verificar si es local con GetDriveTypeW
+        if re.match(r"^[A-Za-z]:", ruta):
+            try:
+                import ctypes
+
+                drive = ruta[:2] + "\\"
+                # DRIVE_FIXED = 2, DRIVE_REMOTE = 4, DRIVE_RAMDISK = 6
+                drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive)
+                # 0 = UNKNOWN, 1 = NO_ROOT_DIR, 4 = REMOTE, 5 = CDROM → no local
+                # 2 = REMOVABLE, 3 = FIXED, 6 = RAMDISK → local
+                return drive_type in (2, 3, 6)
+            except Exception:
+                # Si falla la API, asumir local como fallback conservador
+                return True
+
+        # Rutas relativas o extrañas: asumir local
+        return True
+
+    else:
+        # UNC path (\\servidor\carpeta): remoto también en Linux/WSL.
+        # Se comprueba ANTES de abspath() porque en Linux el backslash no es
+        # separador de ruta y abspath() lo convertiría en algo como
+        # "/cwd/\\servidor\carpeta", perdiendo la forma UNC original.
+        if ruta.startswith("\\\\"):
+            return False
+
+        # Linux: consultar /proc/mounts
+        ruta_abs = os.path.abspath(ruta)
+        try:
+            with open("/proc/mounts", "r", encoding="utf-8") as f:
+                for linea in f:
+                    partes = linea.split()
+                    if len(partes) < 3:
+                        continue
+                    mount_point = partes[1]
+                    fs_type = partes[2]
+                    # Si la ruta está bajo este mount point.
+                    # Se compara respetando el límite de directorio: un
+                    # startswith() a secas haría que "/mnt/rips-backup"
+                    # (local) matcheara el mount point "/mnt/rips" (NAS).
+                    if ruta_abs == mount_point or ruta_abs.startswith(
+                        mount_point.rstrip("/") + "/"
+                    ):
+                        if fs_type in (
+                            "nfs",
+                            "nfs4",
+                            "cifs",
+                            "fuse",
+                            "fuse.sshfs",
+                            "fuse.rclone",
+                        ):
+                            return False
+        except OSError:
+            pass
+        return True
+
+
+# =============================================================================
+# MODO POLLING (clásico, sin cambios funcionales)
+# =============================================================================
+class ModoPolling:
+    """Monitor clásico con os.walk(). Funciona siempre, en cualquier entorno."""
+
+    def __init__(self, rips_dir):
+        self.rips_dir = rips_dir
+        self.historiales = {}
+        self.modo_str = "POLLING"
+
+    def get_active_parts(self):
+        """Devuelve lista de archivos .part que crecieron en los últimos 5s."""
+        ahora = time.time()
+        candidatos = []
+        for root, _, files in os.walk(self.rips_dir):
+            for fname in files:
+                if fname.endswith(".part"):
+                    ruta = os.path.join(root, fname)
+                    try:
+                        st = os.stat(ruta)
+                        if (ahora - st.st_mtime) <= VENTANA_ACTIVO:
+                            candidatos.append((st.st_mtime, ruta, fname, st.st_size))
+                    except OSError:
+                        pass
+        candidatos.sort(key=lambda x: x[0], reverse=True)
+        return [(r, n, t) for _, r, n, t in candidatos]
+
+    def tick(self):
+        """Un ciclo de actualización. Devuelve la lista de activos."""
+        return self.get_active_parts()
+
+    def shutdown(self):
+        """Limpieza al cerrar. En polling no hay nada que limpiar."""
+
+
+# =============================================================================
+# MODO WATCHDOG (eventos push del SO)
+# =============================================================================
+class ModoWatchdog:
+    """
+    Monitor basado en eventos del filesystem (watchdog).
+
+    El SO notifica cada cambio en archivos .part. Un thread del Observer
+    recibe los eventos y actualiza un dict compartido (protegido por Lock).
+    El thread principal lee ese dict cada 100ms y renderiza la UI.
+
+    Debounce implícito: la UI refresca a 10 FPS, así que miles de eventos
+    por segundo se colapsan naturalmente en ~10 frames.
+    """
+
+    def __init__(self, rips_dir):
+        self.rips_dir = rips_dir
+        self._lock = threading.Lock()
+        # ruta -> (mtime, size)
+        self._activos = {}
+        self.historiales = {}
+        self.modo_str = "WATCHDOG"
+        self._observer = None
+        self._inicializar()
+
+    def _inicializar(self):
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+
+        class PartHandler(FileSystemEventHandler):
+            def __init__(self, parent):
+                self.parent = parent
+
+            def on_modified(self, event):
+                if not event.is_directory and event.src_path.endswith(".part"):
+                    self.parent._registrar(event.src_path)
+
+            def on_created(self, event):
+                if not event.is_directory and event.src_path.endswith(".part"):
+                    self.parent._registrar(event.src_path)
+
+            def on_deleted(self, event):
+                if not event.is_directory and event.src_path.endswith(".part"):
+                    self.parent._eliminar(event.src_path)
+
+            def on_moved(self, event):
+                # Si un .part se renombra (termina descarga), eliminar el viejo
+                if event.src_path.endswith(".part"):
+                    self.parent._eliminar(event.src_path)
+                # Si el destino es .part (raro, pero posible), registrar
+                if hasattr(event, "dest_path") and event.dest_path.endswith(".part"):
+                    self.parent._registrar(event.dest_path)
+
+        self._observer = Observer()
+        self._observer.schedule(PartHandler(self), self.rips_dir, recursive=True)
+        self._observer.start()
+
+    def _registrar(self, ruta):
+        """Registra o actualiza un archivo .part en la tabla."""
+        try:
+            st = os.stat(ruta)
+            with self._lock:
+                self._activos[ruta] = (st.st_mtime, st.st_size)
+        except OSError:
+            # El archivo puede haber desaparecido entre el evento y el stat
+            pass
+
+    def _eliminar(self, ruta):
+        """Elimina un archivo .part de la tabla."""
+        with self._lock:
+            self._activos.pop(ruta, None)
+
+    def tick(self):
+        """
+        Devuelve la lista de archivos .part activos (<=5s sin crecer).
+        Limpia entradas vencidas para no mostrar archivos que dejaron de crecer.
+        """
+        ahora = time.time()
+        with self._lock:
+            # Limpiar archivos que no crecieron en los últimos 5s
+            vencidos = [
+                r for r, (m, _) in self._activos.items() if (ahora - m) > VENTANA_ACTIVO
+            ]
+            for r in vencidos:
+                del self._activos[r]
+
+            # Devolver como lista de tuplas (ruta, nombre, tamanio)
+            resultado = []
+            for ruta, (mtime, size) in self._activos.items():
+                resultado.append((ruta, os.path.basename(ruta), size))
+
+            # Ordenar por mtime descendente (más reciente primero)
+            resultado.sort(key=lambda x: self._activos[x[0]][0], reverse=True)
+            return resultado
+
+    def shutdown(self):
+        """Detiene el observer de watchdog de forma segura."""
+        if self._observer is not None:
+            self._observer.stop()
+            self._observer.join(timeout=3)
+
+
+# =============================================================================
+# FACTORY: Auto-detecta el mejor modo
+# =============================================================================
+def crear_monitor(rips_dir: str):
+    """
+    Crea el monitor adecuado para el entorno:
+      1. Si la ruta es remota (NAS/SMB/NFS) → ModoPolling (garantizado)
+      2. Si la ruta es local y watchdog está instalado → ModoWatchdog (eficiente)
+      3. Si la ruta es local pero watchdog no está → ModoPolling (fallback)
+    """
+    if not es_ruta_local(rips_dir):
+        print(f"  {YELLOW}[POLLING] Ruta remota/NAS detectada. Usando os.walk(){RESET}")
+        return ModoPolling(rips_dir)
+
+    try:
+        import watchdog  # noqa: F401
+
+        print(
+            f"  {GREEN}[WATCHDOG] Ruta local detectada. Usando eventos push del SO{RESET}"
+        )
+        return ModoWatchdog(rips_dir)
+    except ImportError:
+        print(
+            f"  {YELLOW}[POLLING] watchdog no instalado (pip install watchdog). Usando os.walk(){RESET}"
+        )
+        return ModoPolling(rips_dir)
+
+
+# =============================================================================
+# RENDERIZADO DE UI (compartido entre modos)
+# =============================================================================
+HEADER_LINES = 6  # +1 línea para el banner de modo
+
+
+def dibujar_panel(activos, historiales, spin_idx, rips_dir, ultimas_filas, modo_str):
+    """Dibuja el panel de archivos .part activos."""
     ahora = time.monotonic()
     lineas = []
 
@@ -161,6 +388,9 @@ def dibujar_panel(activos, historiales, spin_idx, rips_dir, ultimas_filas):
     return filas_necesarias
 
 
+# =============================================================================
+# MAIN
+# =============================================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rips-dir", default=RIPS_DIR)
@@ -181,20 +411,27 @@ def main():
 
     hide_cursor()
 
+    # Crear monitor (auto-detecta watchdog vs polling)
+    monitor = crear_monitor(rips_dir)
+
     sys.stdout.write("\033[2J\033[H")
     print(f"{CYAN}{BOLD}  {'═' * 58}{RESET}")
     print(f"{CYAN}{BOLD}  MONITOR DE DESCARGA ACTIVA{RESET}")
     print(f"{GRAY}  Dir: {rips_dir}{RESET}")
     print(f"{GRAY}  Ventana activa: {VENTANA_ACTIVO}s | Ctrl+C para salir{RESET}")
+    if monitor.modo_str == "WATCHDOG":
+        color_modo = GREEN  # ✅ Eficiente: eventos push del kernel
+    else:
+        color_modo = YELLOW  # ⚠️ Fallback: os.walk() cada 1s
+
+    print(f"{color_modo}{BOLD}  [{monitor.modo_str}]{RESET}")
     print(f"{CYAN}{BOLD}  {'═' * 58}{RESET}")
     sys.stdout.flush()
 
-    historiales = {}  # clave = ruta completa
     spin_idx = 0
     ultimas_filas = 0
 
     TIEMPO_MAXIMO_SIN_CENTINELA_NUEVO = 7200  # 2 horas
-
     motivo_cierre = "normal"
 
     try:
@@ -213,22 +450,27 @@ def main():
             except OSError:
                 break
 
-            activos = get_active_parts(rips_dir)
+            # Obtener activos del modo actual
+            activos = monitor.tick()
 
-            # FIX: clave = ruta completa, no nombre base — debe coincidir con
-            # el historiales.get(ruta, ...) de dibujar_panel, si no, el
-            # historial nunca se encuentra y la velocidad nunca se calcula.
+            # Asegurar historiales para archivos activos
             rutas_activas = {r for r, _, _ in activos}
             for ruta, _, _ in activos:
-                if ruta not in historiales:
-                    historiales[ruta] = deque()
+                if ruta not in monitor.historiales:
+                    monitor.historiales[ruta] = deque()
 
-            for r in list(historiales):
+            # Limpiar historiales de archivos que ya no están activos
+            for r in list(monitor.historiales):
                 if r not in rutas_activas:
-                    del historiales[r]
+                    del monitor.historiales[r]
 
             ultimas_filas = dibujar_panel(
-                activos, historiales, spin_idx, rips_dir, ultimas_filas
+                activos,
+                monitor.historiales,
+                spin_idx,
+                rips_dir,
+                ultimas_filas,
+                monitor.modo_str,
             )
             spin_idx += 1
             time.sleep(intervalo)
@@ -250,6 +492,9 @@ def main():
         else:
             print(f"{GRAY}  Descarga terminada. Cerrando monitor...{RESET}\n")
             time.sleep(1)
+
+        # Limpieza graceful del modo watchdog
+        monitor.shutdown()
 
 
 if __name__ == "__main__":

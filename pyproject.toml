@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pipeline-forense-descarga"
+version = "3.2.1"
+description = "Pipeline de descarga forense de tres capas: orquestación, monitoreo y auditoría"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+keywords = ["forense", "descarga", "gallery-dl", "pipeline", "monitoreo"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+]
+
+dependencies = [
+    # Core: todo es stdlib (json, os, re, sys, threading, time, csv, zipfile, datetime, pathlib, collections, subprocess, argparse, pty, select)
+]
+
+[project.optional-dependencies]
+monitor = [
+    "watchdog>=3.0.0", # Monitor híbrido v3.0: eventos push para rutas locales
+]
+test = ["pytest>=7.4.0", "pytest-cov>=4.1.0"]
+dev = ["pipeline-forense-descarga[monitor,test]"]
+
+[project.scripts]
+descarga = "descarga:main"
+monitor = "monitor:main"
+auditar = "auditar:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

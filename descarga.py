@@ -48,6 +48,9 @@ RE_PROGRESS = re.compile(
 # Ej: [bunkr][debug] post 3309088: Using archive...
 RE_POST_ID = re.compile(r"\[([^\]]+)\]\[(?:debug|info|warning|error)\] post (\d+): ")
 RE_LOG_LINE = re.compile(r"^\[[^\]]+\]\[(?:debug|info|warning|error)\]")
+# Igual que RE_LOG_LINE pero capturando el nivel real, para no confundir
+# ruido de "debug" (ej. "Sleeping X seconds") con warnings/errores genuinos.
+RE_LOG_TAG = re.compile(r"^\[[^\]]+\]\[(debug|info|warning|error)\]")
 
 KEYWORDS_WARNING = ["warning", "rate limit", "sleeping", "skipping"]
 KEYWORDS_ERROR = ["error", "failed", "unsupported", "unable", "exception"]
@@ -58,6 +61,10 @@ KEYWORDS_RUIDO = [
     "None_",
     "extracted",
     "cookies from",
+    # Traceback de formateo cuando keywords['post'] queda en None (ej. tras
+    # un fallo de autenticación del extractor de twitter) — no es un fallo
+    # de descarga real, es un artefacto del formato custom de log.
+    "NoneType' object is not subscriptable",
 ]
 
 TIMEOUT_ACTIVIDAD = 900
@@ -522,8 +529,27 @@ def cargar_estado(lista: list) -> dict:
 
 
 def guardar_estado(state: dict):
-    with open(PATHS["state_file"], "w", encoding="utf-8") as f:
+    """Write-ahead atómico: nunca deja state.json a medias.
+
+    Patrón WAL (Write-Ahead Log):
+      1. Escribe a archivo temporal (.tmp)
+      2. fsync() fuerza volcado a disco físico
+      3. os.replace() atómico en NTFS/ext4
+
+    Si el proceso muere en el paso 1 o 2, state.json original
+    permanece intacto. Si muere en el paso 3, NTFS journal
+    completa o revierte la operación al arrancar.
+    """
+    state_path = PATHS["state_file"]
+    tmp_path = state_path.with_suffix(".json.tmp")
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())  # Fuerza escritura del buffer del SO al disco
+
+    # replace() es atómico: nunca existe un state.json truncado visible
+    os.replace(tmp_path, state_path)
 
 
 # =============================================================================
@@ -557,6 +583,29 @@ def es_linea_error(linea):
     return any(k in ll for k in KEYWORDS_ERROR) and not any(
         x in linea for x in KEYWORDS_RUIDO
     )
+
+
+def clasificar_por_tag(linea: str) -> tuple[bool, bool]:
+    """Clasifica una línea como (es_warning, es_error).
+
+    Si la línea trae un tag explícito de gallery-dl ([...][debug|info|warning|error]),
+    se confía en ese nivel real en vez de adivinar por keywords — así el ruido de
+    debug (ej. "post 13501: Sleeping 1.00 seconds") usado solo para capturar el
+    post_id no se cuenta como warning solo porque contiene la palabra "sleeping".
+    Si no hay tag explícito, se usa el heurístico de keywords como antes.
+    """
+    m_tag = RE_LOG_TAG.match(linea)
+    if m_tag:
+        nivel = m_tag.group(1)
+        if nivel == "warning":
+            return True, False
+        if nivel == "error":
+            return False, True
+        # debug / info: ruido informativo, no cuenta como warning ni error
+        return False, False
+    es_warn = es_linea_warning(linea)
+    es_err = not es_warn and es_linea_error(linea)
+    return es_warn, es_err
 
 
 def limpiar_error(linea):
@@ -724,6 +773,8 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
     errores_hilo = []
     warnings_hilo = []
     post_id_activo = None
+    lock_post_id = threading.Lock()
+    warnings_pendientes = {}
     lock_print = threading.Lock()
     contador = {"seq": 0}
 
@@ -759,32 +810,76 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
         )
 
         def leer_stderr():
-            nonlocal post_id_activo
+            nonlocal post_id_activo, lock_post_id
             for linea in proceso.stderr:
                 linea_strip = ANSI_ESCAPE.sub("", linea).strip()
                 if not linea_strip:
                     continue
+
                 # Capturar post_id desde logs de gallery-dl
                 m = RE_POST_ID.search(linea_strip)
                 if m:
-                    post_id_activo = int(m.group(2))
-                es_warn = es_linea_warning(linea_strip)
-                es_err = not es_warn and es_linea_error(linea_strip)
+                    with lock_post_id:
+                        post_id_activo = int(m.group(2))
+
+                es_warn, es_err = clasificar_por_tag(linea_strip)
+
                 if not es_warn and not es_err:
                     continue
-                # No se imprime en terminal — solo se cuenta y queda
-                # registrado en el .log del hilo (ver posts_fallidos.json
-                # para el link directo al post fallido).
+
+                # -----------------------------------------------------------------
+                # WARNING: guardar temporalmente, no mostrar todavía
+                # -----------------------------------------------------------------
+                if es_warn:
+                    warnings_hilo.append(linea_strip)
+                    # Solo retenemos warnings del downloader HTTP.
+                    if "[downloader.http][warning]" in linea_strip:
+                        with lock_post_id:
+                            clave = post_id_activo
+                        warnings_pendientes[clave] = linea_strip
+                        continue
+
+                # -----------------------------------------------------------------
+                # ERROR: si existe warning HTTP previo del mismo post, incorporarlo
+                # -----------------------------------------------------------------
                 with lock_print:
                     estado_watchdog["ultimo_output"] = time.time()
-                    if es_warn:
-                        warnings_hilo.append(linea_strip)
-                    else:
+                    contador["seq"] += 1
+                    clear_line()
+
+                    if es_err:
+                        texto_error = limpiar_error(linea_strip)
+
+                        with lock_post_id:
+                            pid = post_id_activo
+                        warning_previo = warnings_pendientes.pop(pid, None)
+
+                        if warning_previo:
+                            causa = limpiar_error(warning_previo)
+                            texto_error = f"{texto_error} — {causa}"
+
                         errores_hilo.append(linea_strip)
 
+                        sys.stdout.write(
+                            f"  {RED}[{contador['seq']:>3}] [X] {texto_error}{RESET}\n"
+                        )
+
+                    elif es_warn:
+                        # Warning que NO es downloader.http:
+                        # se comporta como antes y sí se muestra.
+                        sys.stdout.write(
+                            f"  {YELLOW}[{contador['seq']:>3}] [!] "
+                            f"{limpiar_error(linea_strip)}{RESET}\n"
+                        )
+
+                    sys.stdout.flush()
+
         spin = threading.Thread(
-            target=spinner_thread, args=(estado_spinner, lock_print), daemon=True
+            target=spinner_thread,
+            args=(estado_spinner, lock_print),
+            daemon=True,
         )
+
         watch = threading.Thread(
             target=watchdog_thread,
             args=(
@@ -795,7 +890,12 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
             ),
             daemon=True,
         )
-        stderr_thr = threading.Thread(target=leer_stderr, daemon=True)
+
+        stderr_thr = threading.Thread(
+            target=leer_stderr,
+            daemon=True,
+        )
+
         part_watch = threading.Thread(
             target=vigilar_part_thread,
             args=(estado_watchdog, PATHS["rips_dir"]),
@@ -813,13 +913,17 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
                 if not linea_strip:
                     continue
 
+                # Limpiar ANSI para filtrado robusto de logs (v3.2)
+                linea_pura = ANSI_ESCAPE.sub("", linea_strip).strip()
+
                 # Capturar post_id si aparece en stdout (defensivo)
-                m = RE_POST_ID.search(linea_strip)
+                m = RE_POST_ID.search(linea_pura)
                 if m:
-                    post_id_activo = int(m.group(2))
+                    with lock_post_id:
+                        post_id_activo = int(m.group(2))
 
                 # Filtrar líneas de log puro para que no cuenten como archivos
-                if RE_LOG_LINE.search(linea_strip):
+                if RE_LOG_LINE.search(linea_pura):
                     continue
 
                 with lock_print:
@@ -827,9 +931,9 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
                     estado_watchdog["ultimo_archivo"] = time.time()
                     contador["seq"] += 1
 
-                    if linea_strip.startswith("#"):
+                    if linea_pura.startswith("#"):
                         estado_spinner["done"] += 1
-                        ruta = linea_strip[1:].strip()
+                        ruta = linea_pura[1:].strip()
                         clear_line()
                         sys.stdout.write(
                             f"  {GRAY}[{contador['seq']:>3}] [DONE] {nombre_modelo} - {nombre_visible(ruta)}{RESET}\n"
@@ -838,10 +942,10 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
                         estado_spinner["ultima_linea"] = ""
                     else:
                         estado_spinner["nuevo"] += 1
-                        archivos_nuevos.append(linea_strip)
+                        archivos_nuevos.append(linea_pura)
                         clear_line()
                         sys.stdout.write(
-                            f"  {GREEN}[{contador['seq']:>3}] {nombre_modelo} - {nombre_visible(linea_strip)}{RESET}\n"
+                            f"  {GREEN}[{contador['seq']:>3}] {nombre_modelo} - {nombre_visible(linea_pura)}{RESET}\n"
                         )
                         sys.stdout.flush()
                         estado_spinner["ultima_linea"] = ""
@@ -889,6 +993,7 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
     errores_hilo = []
     warnings_hilo = []
     post_id_activo = None
+    warnings_pendientes = {}
     contador_nuevo = 0
     contador_done = 0
     contador_warnings = 0
@@ -1057,17 +1162,18 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                             continue
 
                         es_done = "\x1b[2m" in linea_limpia
-                        es_warning = not es_done and es_linea_warning(linea_limpia)
-                        es_error = (
-                            not es_done
-                            and not es_warning
-                            and (
-                                es_linea_error(linea_limpia)
-                                or "connection broken" in linea_limpia.lower()
-                                or "incompleteread" in linea_limpia.lower()
-                            )
-                        )
                         linea_pura = ANSI_ESCAPE.sub("", linea_limpia).strip()
+
+                        if es_done:
+                            es_warning = False
+                            es_error = False
+                        else:
+                            es_warning, es_error = clasificar_por_tag(linea_pura)
+                            if not es_warning and not es_error:
+                                es_error = (
+                                    "connection broken" in linea_pura.lower()
+                                    or "incompleteread" in linea_pura.lower()
+                                )
 
                         if not linea_pura or linea_pura == ultima_ruta:
                             continue
@@ -1120,14 +1226,41 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
                                 )
                                 sys.stdout.flush()
                             elif es_warning:
-                                # No se imprime en terminal — solo se cuenta y
-                                # queda registrado en el .log del hilo.
                                 contador_warnings += 1
                                 warnings_hilo.append(linea_pura)
+
+                                # Igual que en el motor Windows: los warnings
+                                # de downloader.http se retienen sin mostrar,
+                                # por si preceden a un error del mismo post
+                                # (se fusionan en una sola línea más informativa).
+                                if "[downloader.http][warning]" in linea_pura:
+                                    warnings_pendientes[post_id_activo] = linea_pura
+                                else:
+                                    # Warning que no es downloader.http: se
+                                    # muestra igual, como antes.
+                                    contador_seq += 1
+                                    clear_line()
+                                    sys.stdout.write(
+                                        f"  {YELLOW}[{contador_seq:>3}] [!] {limpiar_error(linea_pura)}{RESET}\n"
+                                    )
+                                    sys.stdout.flush()
                             elif es_error:
-                                # No se imprime en terminal — solo se cuenta y
-                                # queda registrado en el .log del hilo.
                                 errores_hilo.append(linea_pura)
+                                contador_seq += 1
+                                clear_line()
+
+                                texto_error = limpiar_error(linea_pura)
+                                warning_previo = warnings_pendientes.pop(
+                                    post_id_activo, None
+                                )
+                                if warning_previo:
+                                    causa = limpiar_error(warning_previo)
+                                    texto_error = f"{texto_error} — {causa}"
+
+                                sys.stdout.write(
+                                    f"  {RED}[{contador_seq:>3}] [X] {texto_error}{RESET}\n"
+                                )
+                                sys.stdout.flush()
                             else:
                                 contador_seq += 1
                                 contador_nuevo += 1

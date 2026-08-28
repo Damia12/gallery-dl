@@ -1,0 +1,19 @@
+# Pipeline Forense de Descarga - Dependencias
+# Instalar con: pip install -r requirements.txt
+
+# ── Core (stdlib, no necesita instalación) ──
+# json, os, re, sys, threading, time, csv, zipfile, datetime, pathlib, collections, subprocess, argparse
+# Estas vienen con Python 3.10+
+
+# ── Monitor v3.0 — Eventos push del filesystem ──
+# Opcional pero recomendado para HDD mecánicos.
+# Si no está instalado, el monitor cae graceful a polling (os.walk).
+watchdog>=3.0.0
+
+# ── Testing ──
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# ── Linux/WSL específico ──
+# pty ya está en stdlib (no necesita instalación)
+# select ya está en stdlib

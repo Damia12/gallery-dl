@@ -1,5 +1,8 @@
 .venv/
 venv/
+build/
+dist/
+.eggs/
 __pycache__/
 *.pyc
 skip_posts.json
@@ -10,6 +13,9 @@ archive.db
 *.csv
 *.part
 descargas/
+Rips/
+rips/
+descarga.running
 *.zip
 .DS_Store
 Thumbs.db
@@ -35,3 +41,4 @@ Thumbs.db
 dump_*.json
 *.exe
 *.txt
+!requirements.txt

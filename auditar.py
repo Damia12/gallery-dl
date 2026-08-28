@@ -282,42 +282,59 @@ def analizar_logs():
     ):
         ruta = os.path.join(LOG_DIR, archivo)
         try:
-            with open(ruta, "r", encoding="utf-8", errors="replace") as f:
-                lineas = f.readlines()
-
-            # ── Extraer [RESUMEN] ────────────────────────────────────────────
+            # ── Streaming: un solo paso por el log ───────────────────────────
             resumen = {}
-            for linea in lineas:
-                m = RE_RESUMEN.search(linea)
-                if m:
-                    resumen = dict(RE_KV.findall(m.group(1)))
-
-            # ── Extraer posts omitidos ───────────────────────────────────────
             posts_omitidos = ""
-            for linea in lineas:
-                m = RE_POSTS_OMITIDOS.search(linea)
-                if m:
-                    posts_omitidos = m.group(1).strip()
-                    break
-
-            # ── Extraer errores detalle ──────────────────────────────────────
             errores_detalle = []
             en_seccion_errores = False
-            for linea in lineas:
-                ls = linea.strip()
-                if ls == "ERRORES:":
-                    en_seccion_errores = True
-                    continue
-                if en_seccion_errores:
+            fatales = transitorios = 0
+
+            with open(ruta, "r", encoding="utf-8", errors="replace") as f:
+                for linea in f:
+                    ls = linea.strip()
+
+                    # [RESUMEN]
+                    if not resumen:
+                        m = RE_RESUMEN.search(linea)
+                        if m:
+                            resumen = dict(RE_KV.findall(m.group(1)))
+
+                    # Posts omitidos
+                    if not posts_omitidos:
+                        m = RE_POSTS_OMITIDOS.search(linea)
+                        if m:
+                            posts_omitidos = m.group(1).strip()
+
+                    # Errores detalle
+                    if ls == "ERRORES:":
+                        en_seccion_errores = True
+                        continue
+                    if en_seccion_errores:
+                        if (
+                            not ls
+                            or ls in (
+                                "WARNINGS:",
+                                "[RESUMEN]",
+                                "Sin errores.",
+                                "Sin warnings.",
+                            )
+                            or ls.startswith("=")
+                        ):
+                            en_seccion_errores = False
+                        elif ls not in errores_detalle:
+                            errores_detalle.append(ls)
+
+                    # Clasificar errores (fatales vs transitorios)
                     if (
-                        not ls
-                        or ls
-                        in ("WARNINGS:", "[RESUMEN]", "Sin errores.", "Sin warnings.")
-                        or ls.startswith("=")
+                        RE_ERR.search(ls)
+                        and not any(x in ls for x in KEYWORDS_RUIDO)
+                        and "[RESUMEN]" not in ls
                     ):
-                        break
-                    if ls not in errores_detalle:
-                        errores_detalle.append(ls)
+                        tipo = clasificar_error(ls)
+                        if tipo == "FATAL":
+                            fatales += 1
+                        else:
+                            transitorios += 1
 
             errores_str = " | ".join(errores_detalle[:5])  # máx 5 errores únicos
             if len(errores_str) > 500:
@@ -339,24 +356,6 @@ def analizar_logs():
             duracion = int(resumen.get("duracion", 0))
             rc = int(resumen.get("returncode", 0))
             timeout = resumen.get("timeout", "false").lower() == "true"
-
-            # ── Clasificar errores desde el cuerpo del log ───────────────────
-            # (stdout+stderr de gallery-dl escritos por descarga.py)
-            fatales = transitorios = 0
-            if errores > 0:
-                for linea in lineas:
-                    ls = linea.strip()
-                    if not RE_ERR.search(ls):
-                        continue
-                    if any(x in ls for x in KEYWORDS_RUIDO):
-                        continue
-                    if "[RESUMEN]" in ls:
-                        continue
-                    tipo = clasificar_error(ls)
-                    if tipo == "FATAL":
-                        fatales += 1
-                    else:
-                        transitorios += 1
 
             estado = determinar_estado(
                 rc, fatales, transitorios, timeout, nuevos, errores
