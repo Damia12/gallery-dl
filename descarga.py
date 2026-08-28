@@ -763,7 +763,13 @@ def vigilar_part_thread(estado_watchdog: dict, carpeta_raiz, intervalo: int = 20
 
 
 def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = None):
-    cmd = [GDL_CFG["executable"], "-c", GDL_CFG["config_file"]]
+    cmd = [
+        GDL_CFG["executable"],
+        "-c",
+        GDL_CFG["config_file"],
+        "-d",
+        str(PATHS["rips_dir"]),
+    ]
     if extra_args:
         cmd.extend(extra_args)
     cmd.append(url)
@@ -983,7 +989,13 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
 # MOTOR LINUX
 # =============================================================================
 def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None):
-    cmd = [GDL_CFG["executable"], "-c", GDL_CFG["config_file"]]
+    cmd = [
+        GDL_CFG["executable"],
+        "-c",
+        GDL_CFG["config_file"],
+        "-d",
+        str(PATHS["rips_dir"]),
+    ]
     if extra_args:
         cmd.extend(extra_args)
     cmd.append(url)

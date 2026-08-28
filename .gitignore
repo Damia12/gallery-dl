@@ -3,6 +3,9 @@ venv/
 build/
 dist/
 .eggs/
+.pytest_cache/
+*.egg-info/
+*.tmp
 __pycache__/
 .coverage
 coverage.xml
