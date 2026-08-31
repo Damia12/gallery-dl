@@ -262,11 +262,10 @@ class ModoWatchdog:
         self._observer.start()
 
     def _registrar(self, ruta):
-        """Registra o actualiza un archivo .part en la tabla."""
         try:
             st = os.stat(ruta)
             with self._lock:
-                self._activos[ruta] = (st.st_mtime, st.st_size)
+                self._activos[ruta] = (time.time(), st.st_size)
         except OSError:
             # El archivo puede haber desaparecido entre el evento y el stat
             pass

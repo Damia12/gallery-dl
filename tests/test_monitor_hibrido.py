@@ -310,11 +310,57 @@ class TestModoWatchdog:
             path = os.path.join(temp_rips_dir, "stale.part")
             with open(path, "wb") as f:
                 f.write(b"data")
-            old = time.time() - 10
-            os.utime(path, (old, old))
             monitor._registrar(path)
+
+            # Recién registrado: sigue activo.
+            assert len(monitor.tick()) == 1
+
+            # Simulamos que pasaron 10s sin que llegara ningún evento nuevo,
+            # envejeciendo la marca del registro (no el mtime del archivo).
+            with monitor._lock:
+                marca, tam = monitor._activos[path]
+                monitor._activos[path] = (marca - 10, tam)
+
+            assert monitor.tick() == []
+
+    def test_watchdog_no_purga_por_mtime_obsoleto(
+        self, temp_rips_dir, mock_watchdog_module
+    ):
+        """Un mtime viejo NO debe purgar un archivo con evento reciente.
+
+        Regresión del bug de NTFS: la hora de última escritura no se
+        actualiza mientras gallery-dl mantiene abierto el handle del .part,
+        así que un archivo que crece activamente tenía mtime "antiguo" y
+        tick() lo purgaba, mostrando "Sin descarga activa" en plena descarga.
+        La frescura debe venir del evento, no del mtime.
+        """
+        mock_mod, mock_obs_class, mock_obs = mock_watchdog_module
+        with patch.dict(
+            "sys.modules",
+            {
+                "watchdog": mock_mod,
+                "watchdog.observers": mock_mod.observers,
+                "watchdog.events": mock_mod.events,
+            },
+        ):
+            mod = __import__(MONITOR_MODULE, fromlist=["ModoWatchdog"])
+            monitor = mod.ModoWatchdog(temp_rips_dir)
+            path = os.path.join(temp_rips_dir, "creciendo.part")
+            with open(path, "wb") as f:
+                f.write(b"data")
+
+            # mtime muy viejo, como lo reporta NTFS durante una descarga.
+            viejo = time.time() - 3600
+            os.utime(path, (viejo, viejo))
+
+            # Pero el evento acaba de llegar.
+            monitor._registrar(path)
+
             activos = monitor.tick()
-            assert activos == []
+            assert len(activos) == 1, (
+                "el archivo se purgó por mtime obsoleto pese a tener un evento reciente"
+            )
+            assert activos[0][0] == path
 
     def test_watchdog_observer_iniciado(self, temp_rips_dir, mock_watchdog_module):
         """El observer se crea, programa y arranca correctamente."""
