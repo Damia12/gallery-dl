@@ -48,3 +48,8 @@ dump_*.json
 *.exe
 *.txt
 !requirements.txt
+
+# notas de trabajo / auditoria (repo publico)
+*.md
+!README.md
+CLAUDE.md

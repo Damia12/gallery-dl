@@ -767,8 +767,6 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
         GDL_CFG["executable"],
         "-c",
         GDL_CFG["config_file"],
-        "-d",
-        str(PATHS["rips_dir"]),
     ]
     if extra_args:
         cmd.extend(extra_args)
@@ -993,8 +991,6 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
         GDL_CFG["executable"],
         "-c",
         GDL_CFG["config_file"],
-        "-d",
-        str(PATHS["rips_dir"]),
     ]
     if extra_args:
         cmd.extend(extra_args)
@@ -1609,6 +1605,40 @@ def procesar_lote(lote: list):
 # =============================================================================
 # MAIN
 # =============================================================================
+def _pid_vivo(pid: int) -> bool:
+    """Verifica si un PID corresponde a un proceso vivo.
+
+    En Windows, os.kill(pid, 0) NO es un probe de vida: signal.CTRL_C_EVENT
+    vale 0, asi que CPython lo enruta a GenerateConsoleCtrlEvent, que
+    devuelve éxito incluso para un PID ya muerto (falso positivo permanente).
+    Por eso acá se consulta al SO directamente vía OpenProcess.
+    """
+    if IS_WINDOWS:
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        try:
+            codigo_salida = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(codigo_salida)):
+                return False
+            return codigo_salida.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
 def main():
     import shutil
 
@@ -1623,16 +1653,16 @@ def main():
         try:
             with open(CENTINELA, "r", encoding="utf-8") as f:
                 pid = int(f.read().strip())
-            # os.kill(pid, 0) verifica si el proceso existe sin matarlo
-            os.kill(pid, 0)
-            return True
-        except (ValueError, OSError, ProcessLookupError):
-            # PID inválido o proceso muerto
-            try:
-                os.remove(CENTINELA)
-            except OSError:
-                pass
-            return False
+            if _pid_vivo(pid):
+                return True
+        except (ValueError, OSError):
+            pass
+        # PID inválido o proceso muerto: centinela huérfano
+        try:
+            os.remove(CENTINELA)
+        except OSError:
+            pass
+        return False
 
     def iniciar_heartbeat(intervalo: int = 60) -> threading.Event:
         """Refresca el mtime de CENTINELA cada `intervalo` segundos.
