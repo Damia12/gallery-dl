@@ -34,6 +34,7 @@ def _config_sintetico(tmp_path: Path) -> dict:
         "state_file": str(tmp_path / "state.json"),
         "audit_csv": str(tmp_path / "Rips" / "logs" / "auditoria.csv"),
         "skip_posts_file": str(tmp_path / "skip_posts.json"),
+        "posts_fallidos_file": str(tmp_path / "posts_fallidos.json"),
     }
     gdl = {
         "executable": "gallery-dl-fake",
@@ -223,7 +224,7 @@ class TestLimpiarError:
 class TestExtraerThreadId:
 
     def test_url_simpcity_estandar(self, dsc):
-        res = dsc.extraer_thread_id("https://simpcity.cr/threads/shoe0nhead.10665/")
+        res = dsc.extraer_thread_id("https://simpcity.cr/threads/hilo-ejemplo.10665/")
         assert res == ("10665", "simpcity.cr")
 
     def test_conserva_el_dominio_real(self, dsc):

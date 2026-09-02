@@ -44,6 +44,7 @@ def _config_sintetico(tmp_path: Path) -> dict:
         "state_file": str(tmp_path / "state.json"),
         "audit_csv": str(tmp_path / "Rips" / "logs" / "auditoria.csv"),
         "skip_posts_file": str(tmp_path / "skip_posts.json"),
+        "posts_fallidos_file": str(tmp_path / "posts_fallidos.json"),
     }
     return {
         "windows": {
@@ -105,21 +106,24 @@ def descarga_mod(tmp_path, monkeypatch):
 # TEST 1: contrato básico -- stderr no bloquea stdout, clasificación correcta
 # =============================================================================
 
-def test_stderr_no_bloquea_stdout_y_clasifica_correctamente(descarga_mod):
+def test_stderr_no_bloquea_stdout_y_clasifica_correctamente(descarga_mod, tmp_path):
     """
     Ejercita descargar_windows() real contra mock_gallery_dl.py:
     - 3 archivos nuevos + 1 marcado "ya descargado" (línea con '#')
     - 3 líneas de debug en stderr (post_id) que NO deben contarse como
       warnings (ese era justamente el bug que motivó clasificar_por_tag)
-    - post_id_activo debe quedar en el último post logueado (1002)
+    - ningún error, así que `posts_con_error` queda vacío: un post que solo
+      aparece en una línea de debug NO es un post fallido
     """
     descarga_mod.usar_mock(MOCK_GDL_SIMPLE)
+    eventos = descarga_mod.EventLog(tmp_path / "simple.jsonl")
 
     inicio = time.time()
     resultado = descarga_mod.descargar_windows(
-        "https://simpcity.cr/threads/modelo.123", "Modelo"
+        "https://simpcity.cr/threads/modelo.123", "Modelo", eventos=eventos
     )
     duracion = time.time() - inicio
+    eventos.cerrar()
 
     (
         archivos_nuevos,
@@ -130,7 +134,7 @@ def test_stderr_no_bloquea_stdout_y_clasifica_correctamente(descarga_mod):
         timeout,
         dur_reportada,
         returncode,
-        post_id_activo,
+        posts_con_error,
     ) = resultado
 
     # Si stderr bloqueara la lectura de stdout (o viceversa), esta función
@@ -152,27 +156,40 @@ def test_stderr_no_bloquea_stdout_y_clasifica_correctamente(descarga_mod):
     assert errores_hilo == []
     assert warnings_hilo == []
 
-    # post_id_activo debe reflejar el último post logueado por el mock.
-    assert post_id_activo == 1002
+    # Los posts 1000-1002 aparecen en líneas de debug, pero ninguno falló.
+    # El código viejo devolvía "el último post visto" (1002) haya fallado o no.
+    assert posts_con_error == []
+
+    # Los eventos del .jsonl deben reflejar exactamente lo mismo que la tupla:
+    # son la fuente de la que salen el .log y el CSV.
+    archivos = [e for e in eventos.eventos if e["t"] == "archivo"]
+    assert len(archivos) == 4
+    assert sum(1 for e in archivos if e["nuevo"]) == 3
+    assert sum(1 for e in archivos if not e["nuevo"]) == 1
+    assert [e for e in eventos.eventos if e["t"] in ("error", "warning")] == []
 
 
 # =============================================================================
 # TEST 2: fusión warning HTTP + error sobre el mismo post_id
 # =============================================================================
 
-def test_fusion_warning_error_mismo_post(descarga_mod, capsys):
+def test_fusion_warning_error_mismo_post(descarga_mod, capsys, tmp_path):
     """
-    Camino NO cubierto anteriormente por ningún test: un warning de
-    [downloader.http] debe retenerse en warnings_pendientes y, si llega
-    un error sobre el mismo post_id, fusionarse en una sola línea
+    Un warning de [downloader.http] debe retenerse en warnings_pendientes y,
+    si llega un error sobre el mismo post_id, fusionarse en una sola línea
     ("<error> -- <causa>") en la salida -- en vez de imprimirse suelto.
+
+    El mock intercala un post señuelo (9999) entre el warning y el error, así
+    que este test cubre además la atribución: el error es del 5555.
     """
     descarga_mod.usar_mock(MOCK_GDL_WARNING)
+    eventos = descarga_mod.EventLog(tmp_path / "warning.jsonl")
 
     resultado = descarga_mod.descargar_windows(
-        "https://simpcity.cr/threads/modelo.456", "Modelo"
+        "https://simpcity.cr/threads/modelo.456", "Modelo", eventos=eventos
     )
     salida = capsys.readouterr().out
+    eventos.cerrar()
 
     (
         archivos_nuevos,
@@ -183,18 +200,65 @@ def test_fusion_warning_error_mismo_post(descarga_mod, capsys):
         timeout,
         dur_reportada,
         returncode,
-        post_id_activo,
+        posts_con_error,
     ) = resultado
 
-    assert post_id_activo == 5555
     assert returncode == 1
 
     # El warning se cuenta (para el resumen), pero el error real es el
     # que queda registrado como "el" error del hilo.
-    assert warnings_hilo == ["[downloader.http][warning] Rate limit exceeded, retrying"]
-    assert errores_hilo == ["[downloader.http][error] 404 Not Found"]
+    assert warnings_hilo == [
+        "[downloader.http][warning] post 5555: Rate limit exceeded, retrying"
+    ]
+    assert errores_hilo == ["[downloader.http][error] post 5555: 404 Not Found"]
 
     # La salida impresa debe mostrar AMBOS fragmentos fusionados en una
     # sola línea, no el warning suelto en una línea y el error en otra.
     assert "404 Not Found" in salida
     assert "Rate limit exceeded" in salida
+
+
+# =============================================================================
+# TEST 3: atribución -- el error es del post de SU línea, no del último visto
+# =============================================================================
+
+
+def test_el_error_se_atribuye_a_su_propio_post(descarga_mod, tmp_path):
+    """Regresión del bug 2: entre el warning del post 5555 y su error, el mock
+    intercala una línea de debug del post 9999. La versión anterior leía la
+    variable corriente `post_id_activo` y culpaba al 9999.
+
+    Es el mismo bug que en producción registró el post 51013156 en
+    posts_fallidos.json mientras los 49 errores estaban en otros cuatro posts.
+    """
+    descarga_mod.usar_mock(MOCK_GDL_WARNING)
+    eventos = descarga_mod.EventLog(tmp_path / "atribucion.jsonl")
+
+    resultado = descarga_mod.descargar_windows(
+        "https://simpcity.cr/threads/modelo.456", "Modelo", eventos=eventos
+    )
+    eventos.cerrar()
+    posts_con_error = resultado[8]
+
+    assert posts_con_error == [5555]
+    assert 9999 not in posts_con_error
+
+    errores = [e for e in eventos.eventos if e["t"] == "error"]
+    assert len(errores) == 1
+    assert errores[0]["post_id"] == 5555
+    assert errores[0]["origen"] == "downloader.http"
+
+    # El mensaje del evento lleva la causa fusionada: el error de gallery-dl
+    # solo dice que falló, el warning previo dice por qué. Sin esa fusión,
+    # auditar2.es_fatal() no tendría el "404" para clasificar.
+    assert "404 Not Found" in errores[0]["msg"]
+    assert "Rate limit exceeded" in errores[0]["msg"]
+
+    # El warning también queda como evento propio, con su post_id.
+    warnings = [e for e in eventos.eventos if e["t"] == "warning"]
+    assert [w["post_id"] for w in warnings] == [5555]
+
+    # El .jsonl en disco debe tener exactamente los mismos eventos que la
+    # lista en memoria: si el flush fallara, un kill del watchdog los perdería.
+    lineas = (tmp_path / "atribucion.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lineas) == len(eventos.eventos)

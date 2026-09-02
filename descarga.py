@@ -10,6 +10,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# El .log de texto se renderiza de los mismos eventos que el .jsonl, usando el
+# resumen y la clasificación de auditar2. Importarlo en vez de recalcular acá es
+# lo que garantiza que lo que se ve en pantalla, en el .log y en el CSV sea el
+# mismo número. auditar2 es puro: no lee config.json ni toca disco al importarse.
+import auditar2
+
 # Forzar UTF-8 en Windows
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -51,6 +57,17 @@ RE_LOG_LINE = re.compile(r"^\[[^\]]+\]\[(?:debug|info|warning|error)\]")
 # Igual que RE_LOG_LINE pero capturando el nivel real, para no confundir
 # ruido de "debug" (ej. "Sleeping X seconds") con warnings/errores genuinos.
 RE_LOG_TAG = re.compile(r"^\[[^\]]+\]\[(debug|info|warning|error)\]")
+# El módulo que emitió la línea ("download", "downloader.http", "bunkr"...).
+# Va como campo `origen` de los eventos error/warning del .jsonl.
+RE_LOG_ORIGEN = re.compile(r"^\[([^\]]+)\]\[(?:debug|info|warning|error)\]")
+# Prefijo completo, para quedarse solo con el mensaje: el origen y el post_id
+# ya viajan como campos propios del evento, repetirlos dentro del texto los
+# volvería a mezclar.
+# `post None:` aparece de verdad: los extractores que no son de XenForo no
+# tienen keywords.post, y el format del .conf igual imprime el campo.
+RE_LOG_PREFIJO = re.compile(
+    r"^\[[^\]]+\]\[(?:debug|info|warning|error)\]\s*(?:post (?:\d+|None):\s*)?"
+)
 
 KEYWORDS_WARNING = ["warning", "rate limit", "sleeping", "skipping"]
 KEYWORDS_ERROR = ["error", "failed", "unsupported", "unable", "exception"]
@@ -101,6 +118,67 @@ def cargar_configuracion():
 
 
 PATHS, PIPELINE, GDL_CFG = cargar_configuracion()
+
+
+# =============================================================================
+# EVENTOS  (.jsonl — contrato descarga.py -> auditar2.py)
+# =============================================================================
+class EventLog:
+    """Escribe el .jsonl de eventos y conserva la misma lista en memoria.
+
+    Los eventos son el único registro de lo que pasó en una corrida. El .jsonl
+    lo consume auditar2.py; el .log de texto se renderiza de esta misma lista.
+    Al salir las dos vistas de la misma fuente, no pueden contradecirse — que es
+    justo lo que pasaba cuando auditar.py re-parseaba el texto plano.
+
+    Dos detalles deliberados:
+
+    - **El lock.** stdout lo lee el thread principal y stderr un thread
+      dedicado; sin el lock las líneas se entrelazan y el .jsonl queda ilegible.
+    - **El flush por evento.** Si el watchdog mata el proceso, el .jsonl queda
+      truncado pero válido hasta donde llegó, y `auditar2.resumir()` lo marca
+      con `completo: False` en vez de perder la corrida entera.
+
+    Se abre en modo "w": el .jsonl describe la última corrida de esa URL. Si un
+    lote se cae antes de que auditar comprima los logs, la corrida siguiente lo
+    reemplaza en vez de concatenarse (dos bloques inicio/fin en un mismo archivo
+    sumarían los archivos de las dos).
+    """
+
+    def __init__(self, ruta):
+        self.eventos = []
+        self._lock = threading.Lock()
+        self._f = open(ruta, "w", encoding="utf-8")
+
+    def emitir(self, tipo: str, **campos):
+        evento = {"t": tipo, **campos}
+        linea = json.dumps(evento, ensure_ascii=False)
+        with self._lock:
+            self.eventos.append(evento)
+            self._f.write(linea + "\n")
+            self._f.flush()
+
+    def cerrar(self):
+        with self._lock:
+            try:
+                self._f.close()
+            except OSError:
+                pass
+
+
+def partes_de_log(linea: str) -> tuple[str, int | None, str]:
+    """Descompone una línea de log de gallery-dl en (origen, post_id, mensaje).
+
+    El post_id sale de LA LÍNEA MISMA, nunca de una variable corriente: stdout y
+    stderr son streams separados leídos por threads distintos y sin orden
+    garantizado entre sí. Confiar en "el último post visto" es el bug que hacía
+    que posts_fallidos.json acusara al post equivocado.
+    """
+    m_origen = RE_LOG_ORIGEN.match(linea)
+    origen = m_origen.group(1) if m_origen else ""
+    m_post = RE_POST_ID.search(linea)
+    post_id = int(m_post.group(2)) if m_post else None
+    return origen, post_id, RE_LOG_PREFIJO.sub("", linea).strip()
 
 
 # =============================================================================
@@ -202,17 +280,9 @@ def convertir_skip_a_range(valor: dict) -> str | None:
 # =============================================================================
 
 
-def obtener_posts_fallidos_path() -> Path:
-    """Devuelve la ruta de posts_fallidos.json (misma carpeta que skip_posts)."""
-    skip_file = PATHS.get("skip_posts_file")
-    if skip_file:
-        return skip_file.parent / "posts_fallidos.json"
-    return Path(__file__).parent / "posts_fallidos.json"
-
-
 def cargar_posts_fallidos() -> dict:
     """Carga el reporte de posts fallidos sugeridos."""
-    pf_path = obtener_posts_fallidos_path()
+    pf_path = PATHS["posts_fallidos_file"]
     if not pf_path.exists():
         return {}
     try:
@@ -224,7 +294,7 @@ def cargar_posts_fallidos() -> dict:
 
 def guardar_posts_fallidos(data: dict):
     """Guarda el reporte de posts fallidos."""
-    pf_path = obtener_posts_fallidos_path()
+    pf_path = PATHS["posts_fallidos_file"]
     try:
         with open(pf_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -239,7 +309,7 @@ def purgar_posts_fallidos(dias: int = 7, min_intentos: int = 3):
     - Si intentos < min_intentos Y fecha > dias -> eliminar.
     - Si intentos >= min_intentos -> conservar (fallo crónico).
     """
-    pf_path = obtener_posts_fallidos_path()
+    pf_path = PATHS["posts_fallidos_file"]
     if not pf_path.exists():
         return
 
@@ -319,16 +389,20 @@ def detectar_y_reportar_fallidos(
     res: dict,
     post_range: str | None,
     rangos_skip_previos: list | None,
-    post_id_activo: int | None = None,
+    posts_con_error: list | None = None,
 ):
     """Detecta posts candidatos a fallidos y guarda en posts_fallidos.json como reporte.
 
-    Cambios v3.0:
-    - Captura post_id real desde logs de gallery-dl (parent-metadata)
-    - Construye link directo al post de XenForo
-    - Alerta crítica cuando una URL acumula ≥3 fallos
-    - Nuevo estado "timeout_parcial": timeout con archivos descargados antes del crash
-    - Reporta URLs sin post_range con marcador "revisar" para revision manual
+    `posts_con_error` son los post_id que produjeron al menos un error, cada uno
+    leído de su propia línea de log. Antes se recibía un único `post_id_activo`
+    —el último post visto por cualquiera de los dos streams— que solía ser el
+    equivocado: en una corrida real registró el post 51013156, que no había
+    generado ni un error, mientras los 49 errores estaban en otros cuatro posts.
+
+    El reporte entrega el post_id y el link clickeable. NO dice "copiar a
+    skip_posts.json": ese archivo espera la POSICIÓN ORDINAL del post en el
+    hilo (`--post-range` cuenta posiciones, no ids), y el post_id es apenas el
+    primer paso — abrir el link y leer el `#N` que muestra XenForo.
     """
     fallidos = cargar_posts_fallidos()
     url_key = url.rstrip("/")
@@ -347,35 +421,26 @@ def detectar_y_reportar_fallidos(
         return  # No reportar nada si está OK
 
     # -------------------------------------------------------------------------
-    # CASO PRIORITARIO: post_id real capturado desde logs (parent-metadata)
+    # CASO PRIORITARIO: post_id reales capturados de las líneas de error
     # -------------------------------------------------------------------------
-    if post_id_activo is not None:
-        post_url = (
-            f"https://{dominio}/threads/{thread_id}/post-{post_id_activo}"
+    if posts_con_error:
+        acumulados = set(fallidos.get(url_key, {}).get("posts_con_error", []))
+        acumulados.update(posts_con_error)
+        acumulados = sorted(acumulados)
+
+        fallidos[url_key] = {
+            "posts_con_error": acumulados,
+            "post_urls": [
+                f"https://{dominio}/threads/{thread_id}/post-{p}" for p in acumulados
+            ]
             if thread_id
-            else None
-        )
+            else [],
+            "razon": estado,
+            "fecha": datetime.now().strftime("%Y-%m-%d"),
+            "intentos": fallidos.get(url_key, {}).get("intentos", 0) + 1,
+        }
 
-        if url_key not in fallidos:
-            fallidos[url_key] = {
-                "skip": [post_id_activo],
-                "post_id": post_id_activo,
-                "post_url": post_url,
-                "razon": estado,
-                "fecha": datetime.now().strftime("%Y-%m-%d"),
-                "intentos": 1,
-            }
-        else:
-            existing = set(fallidos[url_key].get("skip", []))
-            existing.add(post_id_activo)
-            fallidos[url_key]["skip"] = sorted(existing)
-            fallidos[url_key]["post_id"] = post_id_activo
-            fallidos[url_key]["post_url"] = post_url
-            fallidos[url_key]["razon"] = estado
-            fallidos[url_key]["fecha"] = datetime.now().strftime("%Y-%m-%d")
-            fallidos[url_key]["intentos"] = fallidos[url_key].get("intentos", 0) + 1
-
-        intentos = fallidos[url_key].get("intentos", 0)
+        intentos = fallidos[url_key]["intentos"]
         if intentos >= 3:
             print(
                 f"  {RED}[ALERTA CRÍTICA] URL con {intentos} fallos acumulados — "
@@ -383,10 +448,9 @@ def detectar_y_reportar_fallidos(
             )
 
         guardar_posts_fallidos(fallidos)
-        url_msg = f" — {post_url}" if post_url else ""
         print(
-            f"  {YELLOW}[FALLIDOS] Post {post_id_activo} marcado como fallido"
-            f"{url_msg}{RESET}"
+            f"  {YELLOW}[FALLIDOS] {len(posts_con_error)} post(s) con errores: "
+            f"{', '.join(map(str, posts_con_error))}{RESET}"
         )
         return
 
@@ -398,11 +462,11 @@ def detectar_y_reportar_fallidos(
         if estado in ("timeout_atascado", "timeout_parcial", "fatal"):
             if url_key not in fallidos:
                 fallidos[url_key] = {
-                    "skip": ["revisar"],
+                    "posts_con_error": [],
                     "razon": estado,
                     "fecha": datetime.now().strftime("%Y-%m-%d"),
                     "intentos": 0,
-                    "nota": "Sin post_range configurado. Revisar log manualmente.",
+                    "nota": "Falló sin errores atribuibles a un post. Revisar el log.",
                 }
             else:
                 fallidos[url_key]["razon"] = estado
@@ -417,7 +481,11 @@ def detectar_y_reportar_fallidos(
         return
 
     # -------------------------------------------------------------------------
-    # CASO B: Con post_range -> reportar posts especificos como antes (fallback)
+    # CASO B: con post_range y sin errores atribuibles, solo queda registrar qué
+    # se intentó. OJO CON LA UNIDAD: esto son POSICIONES ORDINALES sacadas del
+    # --post-range, no post_id de XenForo. Por eso va en un campo aparte: son la
+    # misma unidad que skip_posts.json y la contraria a `posts_con_error`, y
+    # mezclarlas es justo la confusión que este rewrite viene a deshacer.
     # -------------------------------------------------------------------------
     ya_skipeados = set()
     if rangos_skip_previos:
@@ -427,25 +495,26 @@ def detectar_y_reportar_fallidos(
     if not candidatos:
         return
 
-    if url_key not in fallidos:
-        fallidos[url_key] = {
-            "skip": [],
+    entrada = fallidos.setdefault(
+        url_key,
+        {
+            "ordinales_intentados": [],
             "razon": estado,
             "fecha": datetime.now().strftime("%Y-%m-%d"),
             "intentos": 0,
-        }
-
-    existing = set(fallidos[url_key].get("skip", []))
-    existing.update(candidatos)
-    fallidos[url_key]["skip"] = sorted(existing)
-    fallidos[url_key]["razon"] = estado
-    fallidos[url_key]["fecha"] = datetime.now().strftime("%Y-%m-%d")
-    fallidos[url_key]["intentos"] = fallidos[url_key].get("intentos", 0) + 1
+        },
+    )
+    entrada["ordinales_intentados"] = sorted(
+        set(entrada.get("ordinales_intentados", [])) | set(candidatos)
+    )
+    entrada["razon"] = estado
+    entrada["fecha"] = datetime.now().strftime("%Y-%m-%d")
+    entrada["intentos"] = entrada.get("intentos", 0) + 1
 
     guardar_posts_fallidos(fallidos)
     print(
-        f"  {YELLOW}[FALLIDOS] {len(candidatos)} post(s) sugerido(s) para skip — "
-        f"revisar posts_fallidos.json antes de aplicar{RESET}"
+        f"  {YELLOW}[FALLIDOS] falló con {len(candidatos)} post(s) en rango, "
+        f"sin error atribuible a uno solo — revisar posts_fallidos.json{RESET}"
     )
 
 
@@ -454,13 +523,16 @@ def imprimir_resumen_fallidos():
     fallidos = cargar_posts_fallidos()
     if not fallidos:
         return
-    total = sum(len(v.get("skip", [])) for v in fallidos.values())
+    total = sum(len(v.get("posts_con_error", [])) for v in fallidos.values())
     urls = len(fallidos)
     print(
-        f"  {YELLOW}⚠️  Posts fallidos detectados (acumulados): {total} en {urls} URL(s){RESET}"
+        f"  {YELLOW}⚠️  Posts con errores (acumulados): {total} en {urls} URL(s){RESET}"
     )
+    # Lo que va en skip_posts.json es la POSICIÓN del post en el hilo, no su id.
+    # El link del reporte es el primer paso: abrirlo y leer el "#N" de XenForo.
     print(
-        f"  {GRAY}   Revisar posts_fallidos.json para aplicar manualmente a skip_posts.json{RESET}"
+        f"  {GRAY}   Revisar posts_fallidos.json: abrir el post_url y anotar en "
+        f"skip_posts.json el #N que muestra XenForo{RESET}"
     )
 
 
@@ -762,7 +834,12 @@ def vigilar_part_thread(estado_watchdog: dict, carpeta_raiz, intervalo: int = 20
         time.sleep(intervalo)
 
 
-def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = None):
+def descargar_windows(
+    url: str,
+    nombre_modelo: str,
+    extra_args: list | None = None,
+    eventos: "EventLog" = None,
+):
     cmd = [
         GDL_CFG["executable"],
         "-c",
@@ -776,8 +853,10 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
     archivos_nuevos = []
     errores_hilo = []
     warnings_hilo = []
-    post_id_activo = None
-    lock_post_id = threading.Lock()
+    # Posts que produjeron al menos un error, cada uno leído de su propia línea.
+    # Reemplaza al viejo `post_id_activo`, que era el último post visto por
+    # cualquiera de los dos streams y por eso acusaba al post equivocado.
+    posts_con_error = set()
     warnings_pendientes = {}
     lock_print = threading.Lock()
     contador = {"seq": 0}
@@ -814,33 +893,31 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
         )
 
         def leer_stderr():
-            nonlocal post_id_activo, lock_post_id
             for linea in proceso.stderr:
                 linea_strip = ANSI_ESCAPE.sub("", linea).strip()
                 if not linea_strip:
                     continue
-
-                # Capturar post_id desde logs de gallery-dl
-                m = RE_POST_ID.search(linea_strip)
-                if m:
-                    with lock_post_id:
-                        post_id_activo = int(m.group(2))
 
                 es_warn, es_err = clasificar_por_tag(linea_strip)
 
                 if not es_warn and not es_err:
                     continue
 
+                # Origen, post_id y mensaje salen de ESTA línea, no de una
+                # variable compartida entre threads.
+                origen, post_id, mensaje = partes_de_log(linea_strip)
+
                 # -----------------------------------------------------------------
                 # WARNING: guardar temporalmente, no mostrar todavía
                 # -----------------------------------------------------------------
                 if es_warn:
                     warnings_hilo.append(linea_strip)
+                    eventos.emitir(
+                        "warning", post_id=post_id, origen=origen, msg=mensaje
+                    )
                     # Solo retenemos warnings del downloader HTTP.
                     if "[downloader.http][warning]" in linea_strip:
-                        with lock_post_id:
-                            clave = post_id_activo
-                        warnings_pendientes[clave] = linea_strip
+                        warnings_pendientes[post_id] = linea_strip
                         continue
 
                 # -----------------------------------------------------------------
@@ -854,15 +931,26 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
                     if es_err:
                         texto_error = limpiar_error(linea_strip)
 
-                        with lock_post_id:
-                            pid = post_id_activo
-                        warning_previo = warnings_pendientes.pop(pid, None)
+                        # El error de gallery-dl no dice POR QUÉ falló: la línea
+                        # es "Failed to download X.jpg" y la causa real
+                        # ("Read timed out", "HTML response", un 404) viaja en el
+                        # warning previo del downloader. Por eso el evento lleva
+                        # el texto fusionado: es lo único que auditar2.es_fatal()
+                        # puede clasificar.
+                        warning_previo = warnings_pendientes.pop(post_id, None)
 
                         if warning_previo:
                             causa = limpiar_error(warning_previo)
                             texto_error = f"{texto_error} — {causa}"
+                            _, _, causa_msg = partes_de_log(warning_previo)
+                            mensaje = f"{mensaje} — {causa_msg}"
 
                         errores_hilo.append(linea_strip)
+                        if post_id is not None:
+                            posts_con_error.add(post_id)
+                        eventos.emitir(
+                            "error", post_id=post_id, origen=origen, msg=mensaje
+                        )
 
                         sys.stdout.write(
                             f"  {RED}[{contador['seq']:>3}] [X] {texto_error}{RESET}\n"
@@ -920,12 +1008,6 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
                 # Limpiar ANSI para filtrado robusto de logs (v3.2)
                 linea_pura = ANSI_ESCAPE.sub("", linea_strip).strip()
 
-                # Capturar post_id si aparece en stdout (defensivo)
-                m = RE_POST_ID.search(linea_pura)
-                if m:
-                    with lock_post_id:
-                        post_id_activo = int(m.group(2))
-
                 # Filtrar líneas de log puro para que no cuenten como archivos
                 if RE_LOG_LINE.search(linea_pura):
                     continue
@@ -938,6 +1020,9 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
                     if linea_pura.startswith("#"):
                         estado_spinner["done"] += 1
                         ruta = linea_pura[1:].strip()
+                        # El "#" es el marcador de gallery-dl para "esta ruta ya
+                        # estaba en archive.db": archivo conocido, no descargado.
+                        eventos.emitir("archivo", path=ruta, nuevo=False)
                         clear_line()
                         sys.stdout.write(
                             f"  {GRAY}[{contador['seq']:>3}] [DONE] {nombre_modelo} - {nombre_visible(ruta)}{RESET}\n"
@@ -947,6 +1032,7 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
                     else:
                         estado_spinner["nuevo"] += 1
                         archivos_nuevos.append(linea_pura)
+                        eventos.emitir("archivo", path=linea_pura, nuevo=True)
                         clear_line()
                         sys.stdout.write(
                             f"  {GREEN}[{contador['seq']:>3}] {nombre_modelo} - {nombre_visible(linea_pura)}{RESET}\n"
@@ -976,7 +1062,7 @@ def descargar_windows(url: str, nombre_modelo: str, extra_args: list | None = No
             estado_watchdog["timeout"],
             int(time.time() - inicio),
             returncode,
-            post_id_activo,
+            sorted(posts_con_error),
         )
     finally:
         sys.stdout.write("\033[?25h")
@@ -1322,11 +1408,97 @@ def descargar_linux(url: str, nombre_modelo: str, extra_args: list | None = None
 
 
 # =============================================================================
+# LOG DE TEXTO  (vista humana de los mismos eventos)
+# =============================================================================
+SEPARADOR = "═" * 60
+
+
+def escribir_log_texto(
+    ruta,
+    url: str,
+    resumen: dict,
+    eventos: list,
+    post_range: str | None = None,
+    rangos_skip: list | None = None,
+):
+    """Renderiza el .log legible a partir de los mismos eventos que el .jsonl.
+
+    El .log dejó de ser un contrato. Antes lo era vía la línea
+    `[RESUMEN] clave="valor"`, que auditar.py parseaba con regex; ahora el
+    contrato es el evento `fin` del .jsonl y este archivo es solo una vista.
+    Cambiar el formato de acá no rompe la auditoría.
+
+    Los errores van agrupados por post porque esa es la unidad accionable: lo
+    que se skipea en XenForo es un post, no un archivo suelto.
+    """
+    resultado = extraer_thread_id(url)
+    thread_id, dominio = resultado if resultado else (None, extraer_dominio(url))
+
+    # Agrupar los mensajes de error por post, en el orden en que ocurrieron.
+    por_post = {}
+    for e in eventos:
+        if e.get("t") == "error":
+            por_post.setdefault(e.get("post_id"), []).append(e.get("msg", ""))
+
+    nuevos = [e["path"] for e in eventos if e.get("t") == "archivo" and e.get("nuevo")]
+
+    with open(ruta, "w", encoding="utf-8") as f:
+        f.write(f"{SEPARADOR}\n")
+        f.write(
+            f" {resumen['nombre_modelo']}"
+            f"  ·  {resumen['ts'].replace('T', ' ')}"
+            f"  ·  {formatear_tiempo(resumen['duracion'])}\n"
+        )
+        f.write(f" {url}\n")
+        f.write(f"{SEPARADOR}\n\n")
+
+        f.write(
+            f"Resumen: {resumen['nuevos']} nuevos, {resumen['ya']} ya descargados, "
+            f"{resumen['errores']} errores, {resumen['warnings']} warnings\n"
+        )
+        f.write(
+            f"Estado:  {auditar2.clasificar(resumen)} "
+            f"(returncode {resumen['returncode']})\n"
+        )
+        if not resumen["completo"]:
+            f.write(
+                "         [!] Sin evento de cierre: el proceso murió antes de "
+                "terminar.\n"
+            )
+        if post_range:
+            f.write(f"Post range: {post_range}\n")
+        if rangos_skip:
+            f.write(f"Posts omitidos: {', '.join(map(str, rangos_skip))}\n")
+
+        if por_post:
+            f.write("\nERRORES POR POST\n")
+            for post_id, msgs in por_post.items():
+                etiqueta = f"post {post_id}" if post_id is not None else "sin post"
+                link = (
+                    f"   https://{dominio}/threads/{thread_id}/post-{post_id}"
+                    if thread_id and post_id is not None
+                    else ""
+                )
+                f.write(f"  {etiqueta}  ({len(msgs)}){link}\n")
+                f.write(f"       {msgs[0]}\n")
+                if len(msgs) > 1:
+                    f.write(f"       (+{len(msgs) - 1} más)\n")
+        else:
+            f.write("\nSin errores.\n")
+
+        if nuevos:
+            f.write(f"\nARCHIVOS ({len(nuevos)})\n")
+            for path in nuevos:
+                f.write(f"  {path}\n")
+
+
+# =============================================================================
 # EJECUTOR DE URL
 # =============================================================================
 def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
     nombre = re.sub(r'[\\/*?:"<>|]', "_", url.rstrip("/").split("/")[-1])[:60]
     log_path = PATHS["log_dir"] / f"{nombre}.log"
+    jsonl_path = PATHS["log_dir"] / f"{nombre}.jsonl"
     PATHS["log_dir"].mkdir(parents=True, exist_ok=True)
     extra_args = []
     post_range = None
@@ -1350,109 +1522,85 @@ def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
                 extra_args.extend(["--post-range", post_range])
                 print(f"  {YELLOW}[RANGE] Descargando posts: {post_range}{RESET}")
 
-    if IS_WINDOWS:
-        (
-            archivos,
-            errs,
-            warns,
-            nuevos,
-            done,
-            timeout,
-            duracion,
-            returncode,
-            post_id_activo,
-        ) = descargar_windows(url, nombre, extra_args)
-    else:
-        (
-            archivos,
-            errs,
-            warns,
-            nuevos,
-            done,
-            timeout,
-            duracion,
-            returncode,
-            post_id_activo,
-        ) = descargar_linux(url, nombre, extra_args)
-    # Deduplicar archivos (gallery-dl puede listar duplicados en stdout)
-    archivos_unicos = list(dict.fromkeys(archivos))
-    archivos = archivos_unicos
-    nuevos = len(archivos)
+    eventos = EventLog(jsonl_path)
+    eventos.emitir(
+        "inicio",
+        url=url,
+        # El nombre se calcula UNA vez, acá, y viaja dentro del evento.
+        # auditar2 lo lee en vez de re-derivarlo de la URL: si esta regla de
+        # nombrado cambia, el CSV la sigue sin que haya que tocar dos archivos.
+        nombre=nombre,
+        ts=datetime.now().isoformat(timespec="seconds"),
+        post_range=post_range,
+    )
 
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nURL: {url}\n")
-        if extra_args:
-            f.write(f"Extra args: {' '.join(extra_args)}\n")
-        if post_range:
-            f.write(f"Post range: {post_range}\n")
-        if rangos_skip:
-            f.write(f"Posts omitidos: {', '.join(map(str, rangos_skip))}\n")
-        if archivos:
-            f.write("\n".join(archivos) + "\n")
-        if errs:
-            f.write("ERRORES:\n" + "\n".join(errs) + "\n")
+    try:
+        if IS_WINDOWS:
+            (
+                archivos,
+                errs,
+                warns,
+                _nuevos,
+                _done,
+                timeout,
+                duracion,
+                returncode,
+                posts_con_error,
+            ) = descargar_windows(url, nombre, extra_args, eventos=eventos)
         else:
-            f.write("Sin errores.\n")
-        if warns:
-            f.write("WARNINGS:\n" + "\n".join(warns) + "\n")
-        resumen_forense = (
-            f'[RESUMEN] nombre_modelo="{nombre}" url="{url}" nuevos="{nuevos}" '
-            f'ya_descargados="{done}" errores="{len(errs)}" warnings="{len(warns)}" '
-            f'duracion="{duracion}" returncode="{returncode}" timeout="{timeout}" '
-            f'post_range="{post_range or "none"}"\n'
+            # Rama congelada (ver CLAUDE.md): descargar_linux no se instrumenta,
+            # así que su .jsonl sale con inicio y fin pero sin eventos `archivo`.
+            (
+                archivos,
+                errs,
+                warns,
+                _nuevos,
+                _done,
+                timeout,
+                duracion,
+                returncode,
+                post_id_activo,
+            ) = descargar_linux(url, nombre, extra_args)
+            posts_con_error = [post_id_activo] if post_id_activo else []
+
+        eventos.emitir(
+            "fin",
+            duracion=duracion,
+            returncode=returncode,
+            timeout=timeout,
         )
-        f.write(resumen_forense)
-        f.write("=" * 60 + "\n\n")
+    finally:
+        eventos.cerrar()
 
-    # Reportar posts candidatos a fallidos (no se aplica automáticamente)
-    detectar_y_reportar_fallidos(
-        url,
-        {
-            "nombre": nombre,
-            "ok": not timeout and len(errs) == 0,
-            "nuevos": nuevos,
-            "done": done,
-            "errores": len(errs),
-            "warnings": len(warns),
-            "timeout": timeout,
-            "duracion": duracion,
-            "returncode": returncode,
-        },
-        post_range,
-        rangos_skip,
-        post_id_activo=post_id_activo,
-    )
+    # Una sola fuente para los totales: los mismos eventos que quedaron en el
+    # .jsonl. Lo que se imprime en pantalla, lo que dice el .log y lo que va al
+    # CSV salen todos de acá, así que no pueden discrepar.
+    resumen = auditar2.resumir(eventos.eventos)
+    escribir_log_texto(log_path, url, resumen, eventos.eventos, post_range, rangos_skip)
 
-    # Autolimpieza: si la descarga fue exitosa, sacar de posts_fallidos
-    limpiar_fallidos_si_exito(
-        url,
-        {
-            "nombre": nombre,
-            "ok": not timeout and len(errs) == 0,
-            "nuevos": nuevos,
-            "done": done,
-            "errores": len(errs),
-            "warnings": len(warns),
-            "timeout": timeout,
-            "duracion": duracion,
-            "returncode": returncode,
-        },
-    )
-
-    return {
-        "nombre": nombre,
-        "ok": not timeout and len(errs) == 0,
-        "nuevos": nuevos,
-        "done": done,
-        "errores": len(errs),
-        "warnings": len(warns),
+    res = {
+        "nombre": resumen["nombre_modelo"],
+        "ok": not timeout and resumen["errores"] == 0,
+        "nuevos": resumen["nuevos"],
+        "done": resumen["ya"],
+        "errores": resumen["errores"],
+        "warnings": resumen["warnings"],
         "timeout": timeout,
         "duracion": duracion,
         "returncode": returncode,
+        "estado": auditar2.clasificar(resumen),
         "archivos": archivos,
         "errs": errs,
         "warns": warns,
     }
+
+    # Reportar posts candidatos a fallidos (no se aplica automáticamente)
+    detectar_y_reportar_fallidos(url, res, post_range, rangos_skip, posts_con_error)
+
+    # Autolimpieza: si la descarga fue exitosa, sacar de posts_fallidos
+    limpiar_fallidos_si_exito(url, res)
+
+    return res
 
 
 # =============================================================================
@@ -1531,18 +1679,33 @@ def procesar_lote(lote: list):
             print(
                 f"  {DIM}(se registra como fallida y el lote continua con la siguiente URL){RESET}"
             )
+            # Una excepción acá también tiene que quedar auditable: se emite un
+            # .jsonl mínimo (inicio + el error + fin con returncode -1) y su
+            # .log correspondiente. Si no, la URL desaparece del CSV como si
+            # nunca se hubiera intentado.
             try:
                 PATHS["log_dir"].mkdir(parents=True, exist_ok=True)
-                log_path = PATHS["log_dir"] / f"{nombre_err}.log"
-                with open(log_path, "a", encoding="utf-8") as lf:
-                    lf.write(
-                        f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"URL: {url}\nEXCEPCION: {e}\n"
-                        f'[RESUMEN] nombre_modelo="{nombre_err}" url="{url}" '
-                        f'nuevos="0" ya_descargados="0" errores="1" warnings="0" '
-                        f'duracion="0" returncode="-1" timeout="false" '
-                        f'post_range="none"\n' + "=" * 60 + "\n\n"
-                    )
+                eventos_err = EventLog(PATHS["log_dir"] / f"{nombre_err}.jsonl")
+                eventos_err.emitir(
+                    "inicio",
+                    url=url,
+                    nombre=nombre_err,
+                    ts=datetime.now().isoformat(timespec="seconds"),
+                    post_range=None,
+                )
+                eventos_err.emitir(
+                    "error", post_id=None, origen="descarga", msg=f"Excepción: {e}"
+                )
+                eventos_err.emitir(
+                    "fin", duracion=0, returncode=-1, timeout=False
+                )
+                eventos_err.cerrar()
+                escribir_log_texto(
+                    PATHS["log_dir"] / f"{nombre_err}.log",
+                    url,
+                    auditar2.resumir(eventos_err.eventos),
+                    eventos_err.eventos,
+                )
             except OSError:
                 pass
             res = {

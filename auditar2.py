@@ -18,27 +18,6 @@ import json
 import re
 
 # =============================================================================
-# IDENTIDAD
-# =============================================================================
-
-# Caracteres inválidos en un nombre de archivo Windows. Misma regla que usa
-# descarga.py:1328 para nombrar el .log/.jsonl.
-#
-# PENDIENTE: esta regla está duplicada entre descarga.py y este módulo, que es
-# justo el patrón de desincronización que el rewrite viene a eliminar. La
-# alternativa es que descarga.py emita `nombre` dentro del evento `inicio`.
-# A decidir antes del bloque B.
-RE_INVALIDOS = re.compile(r'[\\/*?:"<>|]')
-
-
-def nombre_desde_url(url: str) -> str:
-    """Deriva el nombre del modelo desde la URL, igual que descarga.py."""
-    if not url:
-        return ""
-    return RE_INVALIDOS.sub("_", url.rstrip("/").split("/")[-1])[:60]
-
-
-# =============================================================================
 # CLASIFICACIÓN DE ERRORES
 # =============================================================================
 
@@ -101,10 +80,17 @@ def resumir(eventos: list) -> dict:
                            `path` (gallery-dl puede repetir una ruta en stdout)
       errores, warnings <- contados de los eventos `error` / `warning`
       posts_con_error   <- post_id de los eventos `error`, ordenados y únicos
-      url               <- del evento `inicio`
+      url, nombre       <- del evento `inicio`
       duracion,
       returncode,
       timeout           <- del evento `fin` (nadie más los conoce)
+
+    El evento `fin` NO trae contadores a propósito. En descarga.py los totales
+    se calculan contando las mismas listas que producen los eventos, así que
+    duplicarlos no sería una segunda medición: sería la misma, escrita dos
+    veces, incapaz de detectar el error que justificaría existir. Derivarlos
+    tiene además una ventaja concreta: un .jsonl truncado por el watchdog
+    (sin evento `fin`) sigue reportando bien lo que alcanzó a bajar.
 
     `completo` es False si falta el evento `fin`: el proceso murió antes de
     terminar y el resumen no es comparable con los demás.
@@ -138,11 +124,17 @@ def resumir(eventos: list) -> dict:
         elif tipo == "fin":
             fin = e
 
-    url = inicio.get("url", "")
+    # El nombre lo emite descarga.py en el evento `inicio`; acá NO se recalcula
+    # desde la URL. Es la misma regla de nombrado con la que descarga.py bautiza
+    # el .log y el .jsonl, y tenerla en un solo lado es lo que evita que el CSV
+    # apunte a carpetas que no existen si algún día esa regla cambia.
     return {
         "completo": fin is not None,
-        "nombre_modelo": nombre_desde_url(url),
-        "url": url,
+        "nombre_modelo": inicio.get("nombre", ""),
+        "url": inicio.get("url", ""),
+        # Momento en que arrancó la descarga, no en que se auditó: es el dato
+        # que hace comparable una fila del CSV con lo que pasaba esa noche.
+        "ts": inicio.get("ts", ""),
         "nuevos": nuevos,
         "ya": ya,
         "errores": errores,

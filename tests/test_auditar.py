@@ -30,8 +30,19 @@ def escribir_jsonl(tmp_path, nombre, eventos):
     return ruta
 
 
-def ev_inicio(url="https://simpcity.cr/threads/test.12345/", **kw):
-    return {"t": "inicio", "url": url, "ts": "2026-08-31T15:07:49", **kw}
+def ev_inicio(url="https://simpcity.cr/threads/test.12345/", nombre=None, **kw):
+    # En producción el `nombre` lo calcula descarga.py una sola vez y lo emite
+    # acá dentro. Derivarlo de la URL es una comodidad DEL FIXTURE, para no
+    # repetirlo en cada llamada; auditar2 nunca lo recalcula.
+    if nombre is None:
+        nombre = url.rstrip("/").split("/")[-1]
+    return {
+        "t": "inicio",
+        "url": url,
+        "nombre": nombre,
+        "ts": "2026-08-31T15:07:49",
+        **kw,
+    }
 
 
 def ev_archivo(path, nuevo=True):
@@ -466,3 +477,105 @@ class TestFilaCsv:
         r = auditar2.resumir(auditar2.leer_eventos(jsonl_ok))
         fila = dict(zip(auditar2.CSV_HEADER, auditar2.fila_csv(r, "F")))
         assert fila["Posts_con_error"] in ("", [])
+
+
+# =============================================================================
+# LAS DOS DECISIONES DE SCHEMA
+# =============================================================================
+# Estos tests no cubren un bug: fijan dos decisiones de diseño que ya se
+# tomaron, para que un cambio futuro las rompa ruidosamente en vez de en
+# silencio. Ver PLAN_AUDITAR.md, decisiones 21 y 22.
+
+
+class TestNombreVieneDelEvento:
+    """El nombre del modelo lo emite descarga.py; auditar2 no lo deriva."""
+
+    def test_toma_el_nombre_del_evento_inicio(self, tmp_path):
+        ruta = escribir_jsonl(
+            tmp_path,
+            "x.jsonl",
+            [
+                ev_inicio(url="https://simpcity.cr/threads/algo.999/", nombre="algo.999"),
+                ev_fin(),
+            ],
+        )
+        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        assert r["nombre_modelo"] == "algo.999"
+
+    def test_no_lo_recalcula_desde_la_url(self, tmp_path):
+        """Si el nombre y la URL discrepan, gana el nombre emitido.
+
+        Es el caso real que la duplicación provocaba: descarga.py trunca a 60
+        caracteres y reemplaza caracteres inválidos de Windows. Si auditar2
+        volviera a derivarlo de la URL con su propia copia de esa regla, el CSV
+        nombraría una carpeta que no existe en disco.
+        """
+        ruta = escribir_jsonl(
+            tmp_path,
+            "x.jsonl",
+            [
+                ev_inicio(
+                    url="https://simpcity.cr/threads/nombre-larguisimo.123/",
+                    nombre="nombre-truncado",
+                ),
+                ev_fin(),
+            ],
+        )
+        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        assert r["nombre_modelo"] == "nombre-truncado"
+
+    def test_sin_el_campo_queda_vacio_en_vez_de_adivinar(self, tmp_path):
+        """Un .jsonl sin `nombre` deja la celda vacía. Es deliberado: un
+        fallback que recalcula desde la URL reintroduce la duplicación y falla
+        en silencio; una celda vacía se ve."""
+        ruta = escribir_jsonl(
+            tmp_path,
+            "x.jsonl",
+            [{"t": "inicio", "url": "https://simpcity.cr/threads/algo.999/"}, ev_fin()],
+        )
+        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        assert r["nombre_modelo"] == ""
+
+
+class TestFinSinContadores:
+    """Los totales se derivan de los eventos, no se leen del evento `fin`."""
+
+    def test_ignora_contadores_si_alguien_los_agrega_al_fin(self, tmp_path):
+        """Un `fin` con totales inventados no debe poder torcer el resultado."""
+        ruta = escribir_jsonl(
+            tmp_path,
+            "x.jsonl",
+            [
+                ev_inicio(),
+                ev_archivo(r"G:\Rips\Simpcity\test\a.jpg"),
+                ev_archivo(r"G:\Rips\Simpcity\test\b.jpg"),
+                {
+                    "t": "fin",
+                    "nuevos": 999,
+                    "errores": 999,
+                    "duracion": 10,
+                    "returncode": 0,
+                    "timeout": False,
+                },
+            ],
+        )
+        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        assert r["nuevos"] == 2
+        assert r["errores"] == 0
+
+    def test_jsonl_truncado_conserva_lo_que_alcanzo_a_bajar(self, tmp_path):
+        """Sin evento `fin` (watchdog kill), los contadores siguen siendo
+        correctos hasta donde llegó el log. Con contadores en `fin` darían 0."""
+        ruta = escribir_jsonl(
+            tmp_path,
+            "x.jsonl",
+            [
+                ev_inicio(),
+                ev_archivo(r"G:\Rips\Simpcity\test\a.jpg"),
+                ev_archivo(r"G:\Rips\Simpcity\test\b.jpg"),
+                ev_archivo(r"G:\Rips\Simpcity\test\c.jpg"),
+            ],
+        )
+        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        assert r["completo"] is False
+        assert r["nuevos"] == 3

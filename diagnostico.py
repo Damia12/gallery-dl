@@ -127,7 +127,7 @@ def check_config(entorno: str):
     # Estos deben existir para que el pipeline funcione.
     obligatorios = {"rips_dir", "log_dir"}
     # Estos se crean solos en el primer uso; su ausencia no es error.
-    opcionales = {"state_file", "audit_csv", "skip_posts_file"}
+    opcionales = {"state_file", "audit_csv", "skip_posts_file", "posts_fallidos_file"}
 
     for clave, valor in paths.items():
         ruta = Path(expandir(valor))

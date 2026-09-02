@@ -6,7 +6,8 @@
       "lista_file": "C:/gallery-dl/lista.txt",
       "state_file": "C:/gallery-dl/state.json",
       "audit_csv": "G:/Rips/logs/auditoria.csv",
-      "skip_posts_file": "C:/gallery-dl/skip_posts.json"
+      "skip_posts_file": "C:/gallery-dl/skip_posts.json",
+      "posts_fallidos_file": "C:/gallery-dl/posts_fallidos.json"
     },
     "gallery_dl": {
       "executable": "gallery-dl.exe",
@@ -20,7 +21,8 @@
       "lista_file": "/home/felipe/gallery-dl/lista.txt",
       "state_file": "/home/felipe/gallery-dl/state.json",
       "audit_csv": "/home/felipe/Rips/logs/auditoria.csv",
-      "skip_posts_file": "/home/felipe/gallery-dl/skip_posts.json"
+      "skip_posts_file": "/home/felipe/gallery-dl/skip_posts.json",
+      "posts_fallidos_file": "/home/felipe/gallery-dl/posts_fallidos.json"
     },
     "gallery_dl": {
       "executable": "gallery-dl",
