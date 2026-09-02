@@ -250,7 +250,7 @@ def test_el_error_se_atribuye_a_su_propio_post(descarga_mod, tmp_path):
 
     # El mensaje del evento lleva la causa fusionada: el error de gallery-dl
     # solo dice que falló, el warning previo dice por qué. Sin esa fusión,
-    # auditar2.es_fatal() no tendría el "404" para clasificar.
+    # auditar.es_fatal() no tendría el "404" para clasificar.
     assert "404 Not Found" in errores[0]["msg"]
     assert "Rate limit exceeded" in errores[0]["msg"]
 

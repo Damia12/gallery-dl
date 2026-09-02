@@ -11,10 +11,10 @@ from datetime import datetime
 from pathlib import Path
 
 # El .log de texto se renderiza de los mismos eventos que el .jsonl, usando el
-# resumen y la clasificación de auditar2. Importarlo en vez de recalcular acá es
+# resumen y la clasificación de auditar. Importarlo en vez de recalcular acá es
 # lo que garantiza que lo que se ve en pantalla, en el .log y en el CSV sea el
-# mismo número. auditar2 es puro: no lee config.json ni toca disco al importarse.
-import auditar2
+# mismo número. auditar es puro: no lee config.json ni toca disco al importarse.
+import auditar
 
 # Forzar UTF-8 en Windows
 if sys.platform == "win32":
@@ -121,13 +121,13 @@ PATHS, PIPELINE, GDL_CFG = cargar_configuracion()
 
 
 # =============================================================================
-# EVENTOS  (.jsonl — contrato descarga.py -> auditar2.py)
+# EVENTOS  (.jsonl — contrato descarga.py -> auditar.py)
 # =============================================================================
 class EventLog:
     """Escribe el .jsonl de eventos y conserva la misma lista en memoria.
 
     Los eventos son el único registro de lo que pasó en una corrida. El .jsonl
-    lo consume auditar2.py; el .log de texto se renderiza de esta misma lista.
+    lo consume auditar.py; el .log de texto se renderiza de esta misma lista.
     Al salir las dos vistas de la misma fuente, no pueden contradecirse — que es
     justo lo que pasaba cuando auditar.py re-parseaba el texto plano.
 
@@ -136,7 +136,7 @@ class EventLog:
     - **El lock.** stdout lo lee el thread principal y stderr un thread
       dedicado; sin el lock las líneas se entrelazan y el .jsonl queda ilegible.
     - **El flush por evento.** Si el watchdog mata el proceso, el .jsonl queda
-      truncado pero válido hasta donde llegó, y `auditar2.resumir()` lo marca
+      truncado pero válido hasta donde llegó, y `auditar.resumir()` lo marca
       con `completo: False` en vez de perder la corrida entera.
 
     Se abre en modo "w": el .jsonl describe la última corrida de esa URL. Si un
@@ -935,7 +935,7 @@ def descargar_windows(
                         # es "Failed to download X.jpg" y la causa real
                         # ("Read timed out", "HTML response", un 404) viaja en el
                         # warning previo del downloader. Por eso el evento lleva
-                        # el texto fusionado: es lo único que auditar2.es_fatal()
+                        # el texto fusionado: es lo único que auditar.es_fatal()
                         # puede clasificar.
                         warning_previo = warnings_pendientes.pop(post_id, None)
 
@@ -1457,7 +1457,7 @@ def escribir_log_texto(
             f"{resumen['errores']} errores, {resumen['warnings']} warnings\n"
         )
         f.write(
-            f"Estado:  {auditar2.clasificar(resumen)} "
+            f"Estado:  {auditar.clasificar(resumen)} "
             f"(returncode {resumen['returncode']})\n"
         )
         if not resumen["completo"]:
@@ -1527,7 +1527,7 @@ def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
         "inicio",
         url=url,
         # El nombre se calcula UNA vez, acá, y viaja dentro del evento.
-        # auditar2 lo lee en vez de re-derivarlo de la URL: si esta regla de
+        # auditar lo lee en vez de re-derivarlo de la URL: si esta regla de
         # nombrado cambia, el CSV la sigue sin que haya que tocar dos archivos.
         nombre=nombre,
         ts=datetime.now().isoformat(timespec="seconds"),
@@ -1575,7 +1575,7 @@ def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
     # Una sola fuente para los totales: los mismos eventos que quedaron en el
     # .jsonl. Lo que se imprime en pantalla, lo que dice el .log y lo que va al
     # CSV salen todos de acá, así que no pueden discrepar.
-    resumen = auditar2.resumir(eventos.eventos)
+    resumen = auditar.resumir(eventos.eventos)
     escribir_log_texto(log_path, url, resumen, eventos.eventos, post_range, rangos_skip)
 
     res = {
@@ -1588,7 +1588,7 @@ def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
         "timeout": timeout,
         "duracion": duracion,
         "returncode": returncode,
-        "estado": auditar2.clasificar(resumen),
+        "estado": auditar.clasificar(resumen),
         "archivos": archivos,
         "errs": errs,
         "warns": warns,
@@ -1703,7 +1703,7 @@ def procesar_lote(lote: list):
                 escribir_log_texto(
                     PATHS["log_dir"] / f"{nombre_err}.log",
                     url,
-                    auditar2.resumir(eventos_err.eventos),
+                    auditar.resumir(eventos_err.eventos),
                     eventos_err.eventos,
                 )
             except OSError:

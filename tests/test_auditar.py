@@ -1,7 +1,7 @@
-"""Tests de auditar2.py — clasificación y atribución sobre eventos .jsonl.
+"""Tests de auditar.py — clasificación y atribución sobre eventos .jsonl.
 
 A diferencia de test_funciones_puras.py, acá no hace falta copiar el módulo a
-tmp_path: auditar2.py se escribe testeable desde el principio (sin cargar
+tmp_path: auditar.py se escribe testeable desde el principio (sin cargar
 config.json a nivel de módulo), así que se importa directo.
 
 El criterio de cobertura es el del proyecto: se testea lo que falla en
@@ -9,11 +9,14 @@ silencio. Clasificar mal un log no rompe nada visible — solo escribe una
 etiqueta equivocada en un CSV que nadie mira hasta que importa.
 """
 
+import csv
 import json
+import zipfile
+from datetime import datetime
 
 import pytest
 
-import auditar2
+import auditar
 
 
 # =============================================================================
@@ -33,7 +36,7 @@ def escribir_jsonl(tmp_path, nombre, eventos):
 def ev_inicio(url="https://simpcity.cr/threads/test.12345/", nombre=None, **kw):
     # En producción el `nombre` lo calcula descarga.py una sola vez y lo emite
     # acá dentro. Derivarlo de la URL es una comodidad DEL FIXTURE, para no
-    # repetirlo en cada llamada; auditar2 nunca lo recalcula.
+    # repetirlo en cada llamada; auditar nunca lo recalcula.
     if nombre is None:
         nombre = url.rstrip("/").split("/")[-1]
     return {
@@ -185,7 +188,7 @@ def jsonl_falso_fatal(tmp_path):
 
 class TestLeerEventos:
     def test_lee_todos_los_eventos(self, jsonl_ok):
-        eventos = auditar2.leer_eventos(jsonl_ok)
+        eventos = auditar.leer_eventos(jsonl_ok)
         assert len(eventos) == 5
         assert eventos[0]["t"] == "inicio"
         assert eventos[-1]["t"] == "fin"
@@ -201,13 +204,13 @@ class TestLeerEventos:
             + '{"t":"archivo","path":"G:\\\\b.jp',  # cortado a la mitad
             encoding="utf-8",
         )
-        eventos = auditar2.leer_eventos(ruta)
+        eventos = auditar.leer_eventos(ruta)
         assert len(eventos) == 2
 
     def test_archivo_vacio(self, tmp_path):
         ruta = tmp_path / "vacio.jsonl"
         ruta.write_text("", encoding="utf-8")
-        assert auditar2.leer_eventos(ruta) == []
+        assert auditar.leer_eventos(ruta) == []
 
 
 # =============================================================================
@@ -217,7 +220,7 @@ class TestLeerEventos:
 
 class TestResumir:
     def test_cuenta_archivos_nuevos(self, jsonl_ok):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_ok))
+        r = auditar.resumir(auditar.leer_eventos(jsonl_ok))
         assert r["nuevos"] == 3
         assert r["ya"] == 0
 
@@ -233,7 +236,7 @@ class TestResumir:
                 ev_fin(),
             ],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        r = auditar.resumir(auditar.leer_eventos(ruta))
         assert (r["nuevos"], r["ya"]) == (1, 2)
 
     def test_deduplica_por_path(self, tmp_path):
@@ -249,24 +252,24 @@ class TestResumir:
                 ev_fin(),
             ],
         )
-        assert auditar2.resumir(auditar2.leer_eventos(ruta))["nuevos"] == 2
+        assert auditar.resumir(auditar.leer_eventos(ruta))["nuevos"] == 2
 
     def test_toma_url_del_evento_inicio(self, jsonl_falso_fatal):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_falso_fatal))
+        r = auditar.resumir(auditar.leer_eventos(jsonl_falso_fatal))
         assert r["url"] == URL_CASO
 
     def test_toma_duracion_y_returncode_del_evento_fin(self, jsonl_errores):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_errores))
+        r = auditar.resumir(auditar.leer_eventos(jsonl_errores))
         assert r["duracion"] == 1020
         assert r["returncode"] == 4
         assert r["timeout"] is False
 
     def test_falta_evento_fin_marca_incompleto(self, jsonl_incompleto):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_incompleto))
+        r = auditar.resumir(auditar.leer_eventos(jsonl_incompleto))
         assert r["completo"] is False
 
     def test_evento_fin_presente_marca_completo(self, jsonl_ok):
-        assert auditar2.resumir(auditar2.leer_eventos(jsonl_ok))["completo"] is True
+        assert auditar.resumir(auditar.leer_eventos(jsonl_ok))["completo"] is True
 
 
 # =============================================================================
@@ -289,11 +292,11 @@ class TestAtribucionDePosts:
             "uno.jsonl",
             [ev_inicio(), ev_error(13510, "Failed to download"), ev_fin(returncode=4)],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        r = auditar.resumir(auditar.leer_eventos(ruta))
         assert r["posts_con_error"] == [13510]
 
     def test_varios_posts_ordenados_y_sin_repetir(self, jsonl_errores):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_errores))
+        r = auditar.resumir(auditar.leer_eventos(jsonl_errores))
         assert r["posts_con_error"] == [13501, 13510, 13511, 13515]
 
     def test_el_ultimo_post_visto_no_contamina(self, tmp_path):
@@ -309,7 +312,7 @@ class TestAtribucionDePosts:
                 ev_fin(returncode=4),
             ],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        r = auditar.resumir(auditar.leer_eventos(ruta))
         assert r["posts_con_error"] == [13510]
         assert 51013156 not in r["posts_con_error"]
 
@@ -319,7 +322,7 @@ class TestAtribucionDePosts:
             "warn.jsonl",
             [ev_inicio(), ev_warning(13510, "retrying"), ev_fin()],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        r = auditar.resumir(auditar.leer_eventos(ruta))
         assert r["errores"] == 0
         assert r["warnings"] == 1
         assert r["posts_con_error"] == []
@@ -343,7 +346,7 @@ class TestEsFatal:
         ],
     )
     def test_mensajes_fatales(self, msg):
-        assert auditar2.es_fatal(msg) is True
+        assert auditar.es_fatal(msg) is True
 
     @pytest.mark.parametrize(
         "msg",
@@ -355,21 +358,21 @@ class TestEsFatal:
         ],
     )
     def test_mensajes_transitorios(self, msg):
-        assert auditar2.es_fatal(msg) is False
+        assert auditar.es_fatal(msg) is False
 
     def test_no_matchea_numeros_embebidos(self):
         """404 dentro de un ID numérico no es un HTTP 404. Este es el bug 1."""
-        assert auditar2.es_fatal("404998544825100695") is False
+        assert auditar.es_fatal("404998544825100695") is False
 
 
 class TestClasificar:
     def test_descarga_limpia_es_ok(self, jsonl_ok):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_ok))
-        assert auditar2.clasificar(r) == "OK"
+        r = auditar.resumir(auditar.leer_eventos(jsonl_ok))
+        assert auditar.clasificar(r) == "OK"
 
     def test_errores_recuperables_son_transitorios(self, jsonl_errores):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_errores))
-        assert auditar2.clasificar(r) == "TRANSITORIO"
+        r = auditar.resumir(auditar.leer_eventos(jsonl_errores))
+        assert auditar.clasificar(r) == "TRANSITORIO"
 
     def test_error_fatal_es_fatal(self, tmp_path):
         ruta = escribir_jsonl(
@@ -377,8 +380,8 @@ class TestClasificar:
             "fatal.jsonl",
             [ev_inicio(), ev_error(13510, "404 Not Found"), ev_fin(returncode=4)],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
-        assert auditar2.clasificar(r) == "FATAL"
+        r = auditar.resumir(auditar.leer_eventos(ruta))
+        assert auditar.clasificar(r) == "FATAL"
 
     def test_timeout_gana_sobre_todo(self, tmp_path):
         """Prioridad TIMEOUT > FATAL: si lo mataron, eso es lo que pasó."""
@@ -391,24 +394,24 @@ class TestClasificar:
                 ev_fin(returncode=-1, timeout=True),
             ],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
-        assert auditar2.clasificar(r) == "TIMEOUT"
+        r = auditar.resumir(auditar.leer_eventos(ruta))
+        assert auditar.clasificar(r) == "TIMEOUT"
 
     def test_timeout_simple(self, jsonl_timeout):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_timeout))
-        assert auditar2.clasificar(r) == "TIMEOUT"
+        r = auditar.resumir(auditar.leer_eventos(jsonl_timeout))
+        assert auditar.clasificar(r) == "TIMEOUT"
 
     def test_returncode_no_cero_sin_errores_es_transitorio(self, tmp_path):
         ruta = escribir_jsonl(
             tmp_path, "rc.jsonl", [ev_inicio(), ev_fin(returncode=1)]
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
-        assert auditar2.clasificar(r) == "TRANSITORIO"
+        r = auditar.resumir(auditar.leer_eventos(ruta))
+        assert auditar.clasificar(r) == "TRANSITORIO"
 
     def test_solo_devuelve_estados_conocidos(self, jsonl_ok, jsonl_errores, jsonl_timeout):
         for j in (jsonl_ok, jsonl_errores, jsonl_timeout):
-            r = auditar2.resumir(auditar2.leer_eventos(j))
-            assert auditar2.clasificar(r) in auditar2.ESTADOS
+            r = auditar.resumir(auditar.leer_eventos(j))
+            assert auditar.clasificar(r) in auditar.ESTADOS
 
 
 # =============================================================================
@@ -425,21 +428,21 @@ class TestRegresionFalsoFatal:
     """
 
     def test_descarga_perfecta_no_es_fatal(self, jsonl_falso_fatal):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_falso_fatal))
-        assert auditar2.clasificar(r) == "OK"
+        r = auditar.resumir(auditar.leer_eventos(jsonl_falso_fatal))
+        assert auditar.clasificar(r) == "OK"
 
     def test_cuenta_los_219_archivos(self, jsonl_falso_fatal):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_falso_fatal))
+        r = auditar.resumir(auditar.leer_eventos(jsonl_falso_fatal))
         assert r["nuevos"] == 219
 
     def test_no_inventa_errores_desde_los_nombres(self, jsonl_falso_fatal):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_falso_fatal))
+        r = auditar.resumir(auditar.leer_eventos(jsonl_falso_fatal))
         assert r["errores"] == 0
         assert r["posts_con_error"] == []
 
     def test_los_nombres_envenenados_estan_presentes(self, jsonl_falso_fatal):
         """Guarda de la guarda: si el fixture pierde los nombres, no prueba nada."""
-        eventos = auditar2.leer_eventos(jsonl_falso_fatal)
+        eventos = auditar.leer_eventos(jsonl_falso_fatal)
         paths = [e["path"] for e in eventos if e["t"] == "archivo"]
         assert sum("404" in p or "403" in p or "410" in p for p in paths) >= 18
 
@@ -451,13 +454,13 @@ class TestRegresionFalsoFatal:
 
 class TestFilaCsv:
     def test_orden_y_largo_coinciden_con_el_header(self, jsonl_errores):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_errores))
-        fila = auditar2.fila_csv(r, "2026-08-31 15:13:31")
-        assert len(fila) == len(auditar2.CSV_HEADER)
+        r = auditar.resumir(auditar.leer_eventos(jsonl_errores))
+        fila = auditar.fila_csv(r, "2026-08-31 15:13:31")
+        assert len(fila) == len(auditar.CSV_HEADER)
 
     def test_contenido_de_la_fila(self, jsonl_errores):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_errores))
-        fila = dict(zip(auditar2.CSV_HEADER, auditar2.fila_csv(r, "F")))
+        r = auditar.resumir(auditar.leer_eventos(jsonl_errores))
+        fila = dict(zip(auditar.CSV_HEADER, auditar.fila_csv(r, "F")))
         assert fila["Fecha"] == "F"
         assert fila["URL"] == URL_ERRORES
         assert fila["Nuevos"] == 286
@@ -466,16 +469,16 @@ class TestFilaCsv:
         assert fila["Returncode"] == 4
 
     def test_posts_con_error_es_legible_en_una_celda(self, jsonl_errores):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_errores))
-        fila = dict(zip(auditar2.CSV_HEADER, auditar2.fila_csv(r, "F")))
+        r = auditar.resumir(auditar.leer_eventos(jsonl_errores))
+        fila = dict(zip(auditar.CSV_HEADER, auditar.fila_csv(r, "F")))
         celda = str(fila["Posts_con_error"])
         for pid in (13501, 13510, 13511, 13515):
             assert str(pid) in celda
         assert ";" not in celda  # el delimitador del CSV no puede aparecer adentro
 
     def test_sin_errores_deja_la_celda_vacia(self, jsonl_ok):
-        r = auditar2.resumir(auditar2.leer_eventos(jsonl_ok))
-        fila = dict(zip(auditar2.CSV_HEADER, auditar2.fila_csv(r, "F")))
+        r = auditar.resumir(auditar.leer_eventos(jsonl_ok))
+        fila = dict(zip(auditar.CSV_HEADER, auditar.fila_csv(r, "F")))
         assert fila["Posts_con_error"] in ("", [])
 
 
@@ -488,7 +491,7 @@ class TestFilaCsv:
 
 
 class TestNombreVieneDelEvento:
-    """El nombre del modelo lo emite descarga.py; auditar2 no lo deriva."""
+    """El nombre del modelo lo emite descarga.py; auditar no lo deriva."""
 
     def test_toma_el_nombre_del_evento_inicio(self, tmp_path):
         ruta = escribir_jsonl(
@@ -499,14 +502,14 @@ class TestNombreVieneDelEvento:
                 ev_fin(),
             ],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        r = auditar.resumir(auditar.leer_eventos(ruta))
         assert r["nombre_modelo"] == "algo.999"
 
     def test_no_lo_recalcula_desde_la_url(self, tmp_path):
         """Si el nombre y la URL discrepan, gana el nombre emitido.
 
         Es el caso real que la duplicación provocaba: descarga.py trunca a 60
-        caracteres y reemplaza caracteres inválidos de Windows. Si auditar2
+        caracteres y reemplaza caracteres inválidos de Windows. Si auditar
         volviera a derivarlo de la URL con su propia copia de esa regla, el CSV
         nombraría una carpeta que no existe en disco.
         """
@@ -521,7 +524,7 @@ class TestNombreVieneDelEvento:
                 ev_fin(),
             ],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        r = auditar.resumir(auditar.leer_eventos(ruta))
         assert r["nombre_modelo"] == "nombre-truncado"
 
     def test_sin_el_campo_queda_vacio_en_vez_de_adivinar(self, tmp_path):
@@ -533,7 +536,7 @@ class TestNombreVieneDelEvento:
             "x.jsonl",
             [{"t": "inicio", "url": "https://simpcity.cr/threads/algo.999/"}, ev_fin()],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        r = auditar.resumir(auditar.leer_eventos(ruta))
         assert r["nombre_modelo"] == ""
 
 
@@ -559,7 +562,7 @@ class TestFinSinContadores:
                 },
             ],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        r = auditar.resumir(auditar.leer_eventos(ruta))
         assert r["nuevos"] == 2
         assert r["errores"] == 0
 
@@ -576,6 +579,203 @@ class TestFinSinContadores:
                 ev_archivo(r"G:\Rips\Simpcity\test\c.jpg"),
             ],
         )
-        r = auditar2.resumir(auditar2.leer_eventos(ruta))
+        r = auditar.resumir(auditar.leer_eventos(ruta))
         assert r["completo"] is False
         assert r["nuevos"] == 3
+
+
+# =============================================================================
+# ORQUESTACIÓN
+# =============================================================================
+# Todo lo de acá falla en silencio: una fila que no se escribe, un log que se
+# borra sin archivarse, un ZIP que se purga antes de tiempo. Nada de eso se ve
+# en pantalla el día que pasa.
+
+
+@pytest.fixture
+def entorno(tmp_path):
+    """log_dir y rips_dir de mentira, con el mismo schema que config.json."""
+    log_dir = tmp_path / "Rips" / "logs"
+    rips_dir = tmp_path / "Rips"
+    log_dir.mkdir(parents=True)
+    return {
+        "log_dir": log_dir,
+        "rips_dir": rips_dir,
+        "audit_csv": log_dir / "auditoria.csv",
+        "posts_fallidos_file": tmp_path / "posts_fallidos.json",
+    }
+
+
+def poner_log(entorno, nombre, eventos, con_texto=True):
+    """Deja un {nombre}.jsonl (y su .log) en log_dir, como los deja descarga.py."""
+    ruta = escribir_jsonl(entorno["log_dir"], f"{nombre}.jsonl", eventos)
+    if con_texto:
+        (entorno["log_dir"] / f"{nombre}.log").write_text("vista humana", encoding="utf-8")
+    return ruta
+
+
+def leer_csv(entorno):
+    """Devuelve las filas del CSV como dicts, salteando el 'sep=;' de Excel."""
+    texto = entorno["audit_csv"].read_text(encoding="utf-8")
+    lineas = [ln for ln in texto.splitlines() if ln and not ln.startswith("sep=")]
+    filas = list(csv.reader(lineas, delimiter=";"))
+    return [dict(zip(filas[0], f)) for f in filas[1:]]
+
+
+class TestAnalizarLogs:
+    def test_una_fila_por_jsonl(self, entorno):
+        poner_log(entorno, "a", [ev_inicio(nombre="a"), ev_fin()])
+        poner_log(entorno, "b", [ev_inicio(nombre="b"), ev_fin()])
+
+        auditar.analizar_logs(entorno)
+
+        filas = leer_csv(entorno)
+        assert {f["Nombre_Modelo"] for f in filas} == {"a", "b"}
+
+    def test_la_fecha_es_la_de_la_corrida_no_la_de_la_auditoria(self, entorno):
+        """El .jsonl puede auditarse días después: la fila tiene que decir
+        cuándo se descargó, no cuándo se miró."""
+        poner_log(
+            entorno,
+            "a",
+            [ev_inicio(nombre="a", ts="2026-08-31T15:07:49"), ev_fin()],
+        )
+
+        auditar.analizar_logs(entorno)
+
+        assert leer_csv(entorno)[0]["Fecha"] == "2026-08-31 15:07:49"
+
+    def test_clasifica_cada_fila(self, entorno):
+        poner_log(entorno, "ok", [ev_inicio(nombre="ok"), ev_fin()])
+        poner_log(
+            entorno,
+            "malo",
+            [ev_inicio(nombre="malo"), ev_error(1, "404 Not Found"), ev_fin(returncode=4)],
+        )
+
+        auditar.analizar_logs(entorno)
+
+        estados = {f["Nombre_Modelo"]: f["Estado"] for f in leer_csv(entorno)}
+        assert estados == {"ok": "OK", "malo": "FATAL"}
+
+    def test_comprime_el_jsonl_y_su_log_y_los_saca_del_directorio(self, entorno):
+        poner_log(entorno, "a", [ev_inicio(nombre="a"), ev_fin()])
+
+        auditar.analizar_logs(entorno)
+
+        assert list(entorno["log_dir"].glob("*.jsonl")) == []
+        assert list(entorno["log_dir"].glob("*.log")) == []
+        zips = list(entorno["log_dir"].glob("logs_*.zip"))
+        assert len(zips) == 1
+        with zipfile.ZipFile(zips[0]) as z:
+            nombres = [n.split("_", 1)[1] for n in z.namelist()]
+        assert sorted(nombres) == ["a.jsonl", "a.log"]
+
+    def test_un_log_sin_jsonl_se_archiva_pero_no_genera_fila(self, entorno):
+        """Un .log huérfano (de una corrida vieja) no tiene eventos que
+        resumir. Se archiva igual para que log_dir no lo acumule."""
+        poner_log(entorno, "a", [ev_inicio(nombre="a"), ev_fin()])
+        (entorno["log_dir"] / "viejo.log").write_text("sin jsonl", encoding="utf-8")
+
+        auditar.analizar_logs(entorno)
+
+        assert len(leer_csv(entorno)) == 1
+        assert list(entorno["log_dir"].glob("*.log")) == []
+        with zipfile.ZipFile(next(entorno["log_dir"].glob("logs_*.zip"))) as z:
+            assert any(n.endswith("viejo.log") for n in z.namelist())
+
+    def test_jsonl_truncado_igual_genera_fila(self, entorno):
+        """Sin evento `fin` el proceso murió a mitad, pero lo que bajó cuenta."""
+        poner_log(
+            entorno,
+            "cortado",
+            [ev_inicio(nombre="cortado"), ev_archivo(r"G:\a.jpg")],
+        )
+
+        auditar.analizar_logs(entorno)
+
+        fila = leer_csv(entorno)[0]
+        assert fila["Nuevos"] == "1"
+        assert fila["Returncode"] == "-1"
+
+    def test_dos_corridas_acumulan_en_el_mismo_csv(self, entorno):
+        """El CSV es append-only: la segunda auditoría no pisa la primera."""
+        poner_log(entorno, "a", [ev_inicio(nombre="a"), ev_fin()])
+        auditar.analizar_logs(entorno)
+        poner_log(entorno, "b", [ev_inicio(nombre="b"), ev_fin()])
+        auditar.analizar_logs(entorno)
+
+        assert len(leer_csv(entorno)) == 2
+
+    def test_sin_logs_ni_part_no_escribe_csv(self, entorno):
+        auditar.analizar_logs(entorno)
+        assert not entorno["audit_csv"].exists()
+
+
+class TestRegistrarFilas:
+    def test_escribe_el_header_una_sola_vez(self, tmp_path):
+        csv_path = tmp_path / "a.csv"
+        fila = ["x"] * len(auditar.CSV_HEADER)
+        auditar.registrar_filas_en_csv(csv_path, [fila])
+        auditar.registrar_filas_en_csv(csv_path, [fila])
+
+        texto = csv_path.read_text(encoding="utf-8")
+        assert texto.count("Nombre_Modelo") == 1
+        assert texto.startswith("sep=;")  # para que Excel separe columnas solo
+
+    def test_sin_filas_no_crea_el_archivo(self, tmp_path):
+        csv_path = tmp_path / "a.csv"
+        auditar.registrar_filas_en_csv(csv_path, [])
+        assert not csv_path.exists()
+
+
+class TestMantenimiento:
+    def test_purga_zips_viejos_y_conserva_los_nuevos(self, tmp_path):
+        viejo = tmp_path / "logs_2020-01-01.zip"
+        nuevo = tmp_path / f"logs_{datetime.now().strftime('%Y-%m-%d')}.zip"
+        otro = tmp_path / "no_es_un_zip_de_logs.zip"
+        for f in (viejo, nuevo, otro):
+            f.write_bytes(b"")
+
+        assert auditar.purgar_zip_antiguos(tmp_path, dias=60) == 1
+        assert not viejo.exists()
+        assert nuevo.exists() and otro.exists()
+
+    def test_part_huerfanos_ignora_la_carpeta_de_logs(self, tmp_path):
+        """Los .part de descargas van en Rips; un .part dentro de logs sería
+        del propio proceso de auditoría y no un archivo abandonado."""
+        (tmp_path / "modelo").mkdir()
+        (tmp_path / "logs").mkdir()
+        (tmp_path / "modelo" / "a.jpg.part").write_bytes(b"")
+        (tmp_path / "logs" / "b.part").write_bytes(b"")
+
+        encontrados = auditar.buscar_part_huerfanos(tmp_path)
+
+        assert len(encontrados) == 1
+        assert encontrados[0].endswith("a.jpg.part")
+
+    def test_zip_no_borra_los_originales_si_no_pudo_escribir(self, tmp_path):
+        """El borrado va después de cerrar el ZIP: si falla, no se pierde nada."""
+        origen = tmp_path / "a.jsonl"
+        origen.write_text("{}", encoding="utf-8")
+        # log_dir inexistente -> zipfile no puede crear el archivo
+        assert auditar.archivar_en_zip(tmp_path / "no" / "existe", [origen]) == 0
+        assert origen.exists()
+
+
+class TestAvisoPostsFallidos:
+    def test_cuenta_el_campo_nuevo(self, tmp_path, capsys):
+        ruta = tmp_path / "pf.json"
+        ruta.write_text(
+            json.dumps({"https://x/1": {"posts_con_error": [11, 22]}}), encoding="utf-8"
+        )
+        auditar.avisar_posts_fallidos(ruta)
+        salida = capsys.readouterr().out
+        assert "2 post(s)" in salida
+        # La instrucción vieja decía "copiar a skip_posts.json", que espera
+        # ordinales y no post_id. No debe volver.
+        assert "Copiar manualmente" not in salida
+
+    def test_sin_archivo_no_dice_nada(self, tmp_path, capsys):
+        auditar.avisar_posts_fallidos(tmp_path / "no_existe.json")
+        assert capsys.readouterr().out == ""

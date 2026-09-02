@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
-"""
-auditar.py — Auditoría forense de logs generados por descarga.py
-Modelo: append-only CSV + compresión de logs + detección de .part huérfanos
+"""auditar.py — Auditoría forense de las descargas, sobre eventos .jsonl.
+
+Lee los `{nombre}.jsonl` que descarga.py deja en `log_dir`, arma una fila por
+corrida en `auditoria.csv`, comprime los logs del lote en un ZIP diario y avisa
+de los `.part` que quedaron huérfanos.
+
+No re-parsea texto plano, que era el defecto de fondo de la versión anterior. El
+`.log` aplanaba en un solo stream los paths de archivo (datos) y las líneas de
+log (metadatos), y clasificar eso con regex de subcadena producía falsos FATAL:
+un nombre de Instagram con "404" adentro de un ID numérico es indistinguible de
+un HTTP 404. Acá los eventos vienen tipados y cada campo tiene un solo
+significado.
+
+Las funciones puras (`resumir`, `clasificar`, `es_fatal`, `fila_csv`) no leen
+config.json ni tocan disco al importarse: descarga.py las importa para escribir
+su .log y su resumen en pantalla, así que lo que se ve, lo que queda guardado y
+lo que se audita salen todos del mismo conteo.
 """
 
 import csv
@@ -12,6 +26,10 @@ import sys
 import time
 import zipfile
 from datetime import datetime
+from pathlib import Path
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
 
 # =============================================================================
 # ANSI
@@ -25,131 +43,192 @@ YELLOW = "\033[33m"
 CYAN = "\033[36m"
 MAGENTA = "\033[35m"
 
-if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
+# ZIP diario que arma archivar_en_zip(); purgar_zip_antiguos() lo lee de vuelta.
+RE_ZIP_FECHA = re.compile(r"logs_(\d{4}-\d{2}-\d{2})\.zip$")
 
 # =============================================================================
-# CONFIGURACIÓN — mismo schema que descarga.py
+# CLASIFICACIÓN DE ERRORES
 # =============================================================================
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+# Mismos patrones que auditar.py, pero aplicados SOLO al campo `msg` de los
+# eventos de error — nunca a paths de archivo. Ese cambio de dominio es el
+# arreglo; los patrones en sí estaban bien.
+PATRONES_FATAL = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b404\b",
+        r"\b410\b",
+        r"thread.*deleted",
+        r"invalid.*thread",
+        r"unsupported.*url",
+        r"unable to extract",
+        r"failed to parse",
+    )
+]
+
+ESTADOS = ("OK", "TRANSITORIO", "FATAL", "TIMEOUT")
 
 
-def cargar_config() -> dict:
-    if not os.path.exists(CONFIG_PATH):
-        print(f"[X]  {RED}No se encontró config.json en: {CONFIG_PATH}{RESET}")
-        sys.exit(1)
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        raw = json.load(f)
+# =============================================================================
+# LECTURA
+# =============================================================================
 
-    entorno = "windows" if sys.platform == "win32" else "linux"
-    cfg = raw[entorno]
 
-    # Paths resueltos
-    paths = {k: os.path.expanduser(v) for k, v in cfg["paths"].items()}
+def leer_eventos(ruta) -> list:
+    """Lee un .jsonl y devuelve la lista de eventos como dicts.
+
+    Una línea mal formada se descarta sin abortar: un .jsonl truncado por un
+    kill del watchdog debe poder auditarse igual hasta donde llegó.
+    """
+    eventos = []
+    with open(ruta, "r", encoding="utf-8", errors="replace") as f:
+        for linea in f:
+            linea = linea.strip()
+            if not linea:
+                continue
+            try:
+                evento = json.loads(linea)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(evento, dict) and "t" in evento:
+                eventos.append(evento)
+    return eventos
+
+
+# =============================================================================
+# RESUMEN
+# =============================================================================
+
+
+def resumir(eventos: list) -> dict:
+    """Colapsa una lista de eventos en el resumen de una URL.
+
+    Cada campo tiene una sola fuente, sin reconciliación:
+
+      nuevos, ya        <- contados de los eventos `archivo`, deduplicados por
+                           `path` (gallery-dl puede repetir una ruta en stdout)
+      errores, warnings <- contados de los eventos `error` / `warning`
+      posts_con_error   <- post_id de los eventos `error`, ordenados y únicos
+      url, nombre       <- del evento `inicio`
+      duracion,
+      returncode,
+      timeout           <- del evento `fin` (nadie más los conoce)
+
+    El evento `fin` NO trae contadores a propósito. En descarga.py los totales
+    se calculan contando las mismas listas que producen los eventos, así que
+    duplicarlos no sería una segunda medición: sería la misma, escrita dos
+    veces, incapaz de detectar el error que justificaría existir. Derivarlos
+    tiene además una ventaja concreta: un .jsonl truncado por el watchdog
+    (sin evento `fin`) sigue reportando bien lo que alcanzó a bajar.
+
+    `completo` es False si falta el evento `fin`: el proceso murió antes de
+    terminar y el resumen no es comparable con los demás.
+    """
+    inicio = {}
+    fin = None
+    vistos = set()  # paths ya contados
+    nuevos = ya = 0
+    errores = warnings = 0
+    posts = set()
+
+    for e in eventos:
+        tipo = e.get("t")
+        if tipo == "inicio":
+            inicio = e
+        elif tipo == "archivo":
+            path = e.get("path")
+            if path in vistos:
+                continue  # gallery-dl puede repetir una ruta en stdout
+            vistos.add(path)
+            if e.get("nuevo", True):
+                nuevos += 1
+            else:
+                ya += 1
+        elif tipo == "error":
+            errores += 1
+            if (pid := e.get("post_id")) is not None:
+                posts.add(pid)
+        elif tipo == "warning":
+            warnings += 1
+        elif tipo == "fin":
+            fin = e
+
+    # El nombre lo emite descarga.py en el evento `inicio`; acá NO se recalcula
+    # desde la URL. Es la misma regla de nombrado con la que descarga.py bautiza
+    # el .log y el .jsonl, y tenerla en un solo lado es lo que evita que el CSV
+    # apunte a carpetas que no existen si algún día esa regla cambia.
     return {
-        "log_dir": paths["log_dir"],
-        "rips_dir": paths["rips_dir"],
-        "audit_csv": paths["audit_csv"],
+        "completo": fin is not None,
+        "nombre_modelo": inicio.get("nombre", ""),
+        "url": inicio.get("url", ""),
+        # Momento en que arrancó la descarga, no en que se auditó: es el dato
+        # que hace comparable una fila del CSV con lo que pasaba esa noche.
+        "ts": inicio.get("ts", ""),
+        "nuevos": nuevos,
+        "ya": ya,
+        "errores": errores,
+        "warnings": warnings,
+        "posts_con_error": sorted(posts),
+        "duracion": (fin or {}).get("duracion", 0),
+        "returncode": (fin or {}).get("returncode", -1),
+        "timeout": (fin or {}).get("timeout", False),
+        "errores_msg": [
+            e["msg"] for e in eventos if e.get("t") == "error" and "msg" in e
+        ],
     }
 
 
-CFG = cargar_config()
-LOG_DIR = CFG["log_dir"]
-RIPS_DIR = CFG["rips_dir"]
-AUDIT_CSV = CFG["audit_csv"]
-
 # =============================================================================
-# REGEX
-# =============================================================================
-
-# Línea [RESUMEN] escrita por descarga.py — pares clave="valor"
-RE_RESUMEN = re.compile(r"\[RESUMEN\](.+)", re.IGNORECASE)
-RE_KV = re.compile(r'(\w+)="([^"]*)"')
-RE_POSTS_OMITIDOS = re.compile(r"Post[s]? omitidos: (.+)", re.IGNORECASE)
-
-# Errores en el cuerpo del log (stdout/stderr de gallery-dl)
-RE_ERR = re.compile(
-    r"(error|HttpError|urllib\.error|ConnectionError|ReadTimeout|"
-    r"404|410|403|unable to extract|failed to parse|thread deleted|"
-    r"invalid thread|unsupported url)",
-    re.IGNORECASE,
-)
-
-KEYWORDS_RUIDO = [
-    "theme-light",
-    "color-",
-    "--rem",
-    "None_",
-    "logging",
-    "extracted",
-    "cookies from",
-]
-
-FATAL_PATTERNS = [
-    re.compile(r"404", re.IGNORECASE),
-    re.compile(r"410", re.IGNORECASE),
-    re.compile(r"thread.*deleted", re.IGNORECASE),
-    re.compile(r"invalid.*thread", re.IGNORECASE),
-    re.compile(r"unsupported.*url", re.IGNORECASE),
-    re.compile(r"unable to extract", re.IGNORECASE),
-    re.compile(r"failed to parse", re.IGNORECASE),
-]
-
-# =============================================================================
-# CLASIFICACIÓN
+# ESTADO
 # =============================================================================
 
 
-def clasificar_error(linea: str) -> str:
-    for pattern in FATAL_PATTERNS:
-        if pattern.search(linea):
-            return "FATAL"
-    return "TRANSITORIO"
+def es_fatal(mensaje: str) -> bool:
+    """True si el mensaje de error corresponde a un fallo no recuperable.
 
-
-def determinar_estado(
-    returncode: int,
-    fatales: int,
-    transitorios: int,
-    timeout: bool = False,
-    nuevos: int = 0,
-    errores: int = 0,
-) -> str:
+    Solo debe recibir el campo `msg` de un evento `error`. Pasarle un path de
+    archivo es el bug que este módulo existe para eliminar.
     """
-    Evolución v2.0: Clasificación inteligente de estados.
-    Prioridad: TIMEOUT (Diferenciado) > FATAL > TRANSITORIO > OK
-    """
-    if timeout:
-        # Si hubo progreso real y la tasa de error es baja (< 20% del contenido nuevo)
-        if nuevos > 0 and errores < (nuevos * 0.20):
-            return "TIMEOUT_SANANDO"  # Hilo masivo en progreso saludable
-        else:
-            return "TIMEOUT_ATASCADO"  # Atascado por hosts caídos (ej. TurboCDN)
+    return any(p.search(mensaje) for p in PATRONES_FATAL)
 
-    if fatales > 0:
+
+def clasificar(resumen: dict) -> str:
+    """Devuelve uno de ESTADOS a partir de un resumen.
+
+    Prioridad: TIMEOUT > FATAL > TRANSITORIO > OK.
+
+      TIMEOUT      el watchdog mató el proceso
+      FATAL        algún evento `error` matchea PATRONES_FATAL
+      TRANSITORIO  hubo errores no fatales, o returncode != 0
+      OK           ninguna de las anteriores
+
+    Los estados TIMEOUT_SANANDO / TIMEOUT_ATASCADO de auditar.py no
+    sobreviven: codificaban un umbral inventado (errores < nuevos * 0.20) que
+    nunca se validó contra datos. La distinción se lee de las columnas
+    Nuevos y Errores del CSV.
+    """
+    if resumen.get("timeout"):
+        return "TIMEOUT"
+    if any(es_fatal(m) for m in resumen.get("errores_msg", ())):
         return "FATAL"
-    if transitorios > 0:
-        return "TRANSITORIO"
-    if returncode != 0:
+    if resumen.get("errores", 0) > 0 or resumen.get("returncode", 0) != 0:
         return "TRANSITORIO"
     return "OK"
 
 
 # =============================================================================
-# CSV — append-only
+# CSV
 # =============================================================================
 
 CSV_HEADER = [
     "Fecha",
     "Nombre_Modelo",
     "URL",
-    "Post_omitidos",
     "Nuevos",
     "Ya_descargados",
     "Errores",
-    "Errores_detalle",
+    "Warnings",
+    "Posts_con_error",
     "Duracion_s",
     "Returncode",
     "Timeout",
@@ -157,17 +236,75 @@ CSV_HEADER = [
 ]
 
 
-def registrar_filas_en_csv(filas: list):
-    """Escribe todas las filas del lote en una sola apertura del CSV."""
+def fila_csv(resumen: dict, fecha: str) -> list:
+    """Arma la fila del CSV a partir de un resumen. Mismo orden que CSV_HEADER.
+
+    Los post_id van separados por coma: el delimitador del CSV es ';' y no
+    puede aparecer dentro de una celda.
+    """
+    return [
+        fecha,
+        resumen["nombre_modelo"],
+        resumen["url"],
+        resumen["nuevos"],
+        resumen["ya"],
+        resumen["errores"],
+        resumen["warnings"],
+        ", ".join(str(p) for p in resumen["posts_con_error"]),
+        resumen["duracion"],
+        resumen["returncode"],
+        "Sí" if resumen["timeout"] else "No",
+        clasificar(resumen),
+    ]
+
+
+# =============================================================================
+# CONFIGURACIÓN
+# =============================================================================
+# Nada de esto corre al importar el módulo: descarga.py lo importa solo por
+# resumir()/clasificar(), y los tests por las funciones puras. La config se lee
+# recién cuando alguien pide la orquestación.
+
+
+def cargar_config(ruta=None) -> dict:
+    """Devuelve TODAS las rutas declaradas en config.json, sin filtrar.
+
+    El auditar viejo se quedaba solo con log_dir/rips_dir/audit_csv y por eso
+    tuvo que inventar dónde estaba posts_fallidos.json: lo buscaba junto al CSV
+    mientras descarga.py lo escribía en la carpeta del script. Su aviso no
+    disparó nunca. Ahora la ruta se declara una vez y los dos la leen.
+    """
+    ruta = Path(ruta) if ruta else Path(__file__).parent / "config.json"
+    if not ruta.exists():
+        print(f"  {RED}[X] No se encontró config.json en: {ruta}{RESET}")
+        sys.exit(1)
+    with open(ruta, encoding="utf-8") as f:
+        data = json.load(f)
+    entorno = "windows" if sys.platform == "win32" else "linux"
+    return {k: Path(os.path.expanduser(v)) for k, v in data[entorno]["paths"].items()}
+
+
+# =============================================================================
+# CSV
+# =============================================================================
+
+
+def registrar_filas_en_csv(csv_path, filas: list):
+    """Append de todas las filas del lote en una sola apertura.
+
+    El `sep=;` de la primera línea es para que Excel abra el archivo con las
+    columnas separadas sin preguntar. Reintenta unas veces porque el CSV puede
+    estar abierto en Excel justo cuando termina un lote.
+    """
     if not filas:
         return
-    os.makedirs(os.path.dirname(AUDIT_CSV), exist_ok=True)
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     for _ in range(5):
         try:
-            with open(AUDIT_CSV, "a+", newline="", encoding="utf-8") as f:
+            with open(csv_path, "a+", newline="", encoding="utf-8") as f:
                 f.seek(0)
-                es_nuevo = not f.read(4)
-                if es_nuevo:
+                if not f.read(4):
                     f.write("sep=;\n")
                     csv.writer(f, delimiter=";").writerow(CSV_HEADER)
                 f.seek(0, os.SEEK_END)
@@ -182,269 +319,198 @@ def registrar_filas_en_csv(filas: list):
 
 
 # =============================================================================
-# LOGS — compresión y purga
+# MANTENIMIENTO
 # =============================================================================
 
 
-def archivar_logs_en_zip(rutas: list):
+def archivar_en_zip(log_dir, rutas: list) -> int:
+    """Comprime los logs del lote en el ZIP del día y los borra del directorio.
+
+    Entran el .jsonl y el .log de cada URL: el .jsonl es el dato y el .log es la
+    vista, y archivar solo uno dejaría la mitad de la corrida sin respaldo.
+    """
+    rutas = [Path(r) for r in rutas if Path(r).exists()]
     if not rutas:
-        return
-    zip_file = os.path.join(LOG_DIR, f"logs_{datetime.now().strftime('%Y-%m-%d')}.zip")
+        return 0
+    zip_file = Path(log_dir) / f"logs_{datetime.now().strftime('%Y-%m-%d')}.zip"
     try:
-        with zipfile.ZipFile(zip_file, "a", compression=zipfile.ZIP_DEFLATED) as zipf:
+        with zipfile.ZipFile(zip_file, "a", compression=zipfile.ZIP_DEFLATED) as z:
+            ts = datetime.now().strftime("%H%M%S")
             for ruta in rutas:
-                if os.path.exists(ruta):
-                    ts = datetime.now().strftime("%H%M%S")
-                    zipf.write(ruta, arcname=f"{ts}_{os.path.basename(ruta)}")
-        for ruta in rutas:
-            try:
-                os.remove(ruta)
-            except OSError:
-                pass
-    except Exception as e:
+                z.write(ruta, arcname=f"{ts}_{ruta.name}")
+    except OSError as e:
         print(f"  {RED}[X] Error comprimiendo logs: {e}{RESET}")
+        return 0
+    # Recién se borran con el ZIP ya cerrado: si la escritura falla, los
+    # originales siguen en disco.
+    for ruta in rutas:
+        try:
+            ruta.unlink()
+        except OSError:
+            pass
+    return len(rutas)
 
 
-def purgar_zip_antiguos(dias: int = 60):
-    if not os.path.exists(LOG_DIR):
-        return
+def purgar_zip_antiguos(log_dir, dias: int = 60) -> int:
+    log_dir = Path(log_dir)
+    if not log_dir.exists():
+        return 0
     ahora = datetime.now()
     purgados = 0
-    for archivo in os.listdir(LOG_DIR):
-        m = re.match(r"logs_(\d{4}-\d{2}-\d{2})\.zip", archivo)
+    for archivo in log_dir.iterdir():
+        m = RE_ZIP_FECHA.match(archivo.name)
         if not m:
             continue
         try:
-            fecha = datetime.strptime(m.group(1), "%Y-%m-%d")
-            if (ahora - fecha).days > dias:
-                os.remove(os.path.join(LOG_DIR, archivo))
+            if (ahora - datetime.strptime(m.group(1), "%Y-%m-%d")).days > dias:
+                archivo.unlink()
                 purgados += 1
-        except Exception:
+        except (ValueError, OSError):
             pass
-    if purgados:
-        print(
-            f"  {GRAY}[MANTENIMIENTO] {purgados} ZIP(s) eliminados (+{dias} días).{RESET}"
-        )
+    return purgados
 
 
-# =============================================================================
-# ARCHIVOS .part HUÉRFANOS
-# =============================================================================
-
-
-def buscar_part_huerfanos() -> list:
-    encontrados = []
-    if not os.path.exists(RIPS_DIR):
-        return encontrados
-    for raiz, _, archivos in os.walk(RIPS_DIR):
-        if "logs" in raiz.lower():
-            continue
-        for archivo in archivos:
-            if archivo.endswith(".part"):
-                encontrados.append(os.path.join(raiz, archivo))
-    return encontrados
-
-
-# =============================================================================
-# MOTOR PRINCIPAL
-# =============================================================================
-
-
-def analizar_logs():
-    if not os.path.exists(LOG_DIR):
-        print(f"\n  {RED}[X] Directorio de logs no existe: {LOG_DIR}{RESET}\n")
-        return
-
-    logs = [
-        f for f in os.listdir(LOG_DIR) if f.endswith(".log") and f != "procesados.log"
+def buscar_part_huerfanos(rips_dir) -> list:
+    """Un .part sin proceso vivo detrás es una descarga que quedó a mitad."""
+    rips_dir = Path(rips_dir)
+    if not rips_dir.exists():
+        return []
+    return [
+        str(Path(raiz) / archivo)
+        for raiz, _, archivos in os.walk(rips_dir)
+        if "logs" not in raiz.lower()
+        for archivo in archivos
+        if archivo.endswith(".part")
     ]
-    huerfanos = buscar_part_huerfanos()
 
-    if not logs and not huerfanos:
+
+# =============================================================================
+# ORQUESTACIÓN
+# =============================================================================
+
+
+def analizar_logs(cfg: dict | None = None) -> dict | None:
+    """Audita los .jsonl pendientes en log_dir: CSV, ZIP y .part huérfanos."""
+    cfg = cfg or cargar_config()
+    log_dir, rips_dir = Path(cfg["log_dir"]), Path(cfg["rips_dir"])
+
+    if not log_dir.exists():
+        print(f"\n  {RED}[X] Directorio de logs no existe: {log_dir}{RESET}\n")
+        return None
+
+    jsonls = sorted(log_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    huerfanos = buscar_part_huerfanos(rips_dir)
+
+    if not jsonls and not huerfanos:
         print(f"\n  {GREEN}[+] Sin logs nuevos ni archivos .part huérfanos.{RESET}\n")
-        return
+        return None
 
-    ahora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logs_a_comprimir = []
-    filas_csv = []
+    filas = []
+    a_comprimir = []
+    conteo = dict.fromkeys(ESTADOS, 0)
+    conteo["incompletos"] = 0
 
-    conteo = {
-        "ok": 0,
-        "transitorio": 0,
-        "fatal": 0,
-        "timeout_sanando": 0,
-        "timeout_atascado": 0,
-        "timeout": 0,
-        "sin_resumen": 0,
-    }
-    for archivo in sorted(
-        logs, key=lambda f: os.path.getmtime(os.path.join(LOG_DIR, f))
-    ):
-        ruta = os.path.join(LOG_DIR, archivo)
+    for ruta in jsonls:
         try:
-            # ── Streaming: un solo paso por el log ───────────────────────────
-            resumen = {}
-            posts_omitidos = ""
-            errores_detalle = []
-            en_seccion_errores = False
-            fatales = transitorios = 0
-
-            with open(ruta, "r", encoding="utf-8", errors="replace") as f:
-                for linea in f:
-                    ls = linea.strip()
-
-                    # [RESUMEN]
-                    if not resumen:
-                        m = RE_RESUMEN.search(linea)
-                        if m:
-                            resumen = dict(RE_KV.findall(m.group(1)))
-
-                    # Posts omitidos
-                    if not posts_omitidos:
-                        m = RE_POSTS_OMITIDOS.search(linea)
-                        if m:
-                            posts_omitidos = m.group(1).strip()
-
-                    # Errores detalle
-                    if ls == "ERRORES:":
-                        en_seccion_errores = True
-                        continue
-                    if en_seccion_errores:
-                        if (
-                            not ls
-                            or ls in (
-                                "WARNINGS:",
-                                "[RESUMEN]",
-                                "Sin errores.",
-                                "Sin warnings.",
-                            )
-                            or ls.startswith("=")
-                        ):
-                            en_seccion_errores = False
-                        elif ls not in errores_detalle:
-                            errores_detalle.append(ls)
-
-                    # Clasificar errores (fatales vs transitorios)
-                    if (
-                        RE_ERR.search(ls)
-                        and not any(x in ls for x in KEYWORDS_RUIDO)
-                        and "[RESUMEN]" not in ls
-                    ):
-                        tipo = clasificar_error(ls)
-                        if tipo == "FATAL":
-                            fatales += 1
-                        else:
-                            transitorios += 1
-
-            errores_str = " | ".join(errores_detalle[:5])  # máx 5 errores únicos
-            if len(errores_str) > 500:
-                errores_str = errores_str[:497] + "..."
-            if not errores_str:
-                errores_str = "Ninguno"
-
-            if not resumen:
-                # Log sin [RESUMEN]: proceso interrumpido o log vacío
-                conteo["sin_resumen"] += 1
-                logs_a_comprimir.append(ruta)
-                continue
-
-            nombre = resumen.get("nombre_modelo", archivo.replace(".log", ""))
-            url = resumen.get("url", "")
-            nuevos = int(resumen.get("nuevos", 0))
-            ya = int(resumen.get("ya_descargados", 0))
-            errores = int(resumen.get("errores", 0))
-            duracion = int(resumen.get("duracion", 0))
-            rc = int(resumen.get("returncode", 0))
-            timeout = resumen.get("timeout", "false").lower() == "true"
-
-            estado = determinar_estado(
-                rc, fatales, transitorios, timeout, nuevos, errores
-            )
-            conteo[estado.lower()] += 1
-
-            filas_csv.append(
-                [
-                    ahora_str,
-                    nombre,
-                    url,
-                    posts_omitidos,
-                    nuevos,
-                    ya,
-                    errores,
-                    errores_str,
-                    duracion,
-                    rc,
-                    "Sí" if timeout else "No",
-                    estado,
-                ]
-            )
-            logs_a_comprimir.append(ruta)
-
-        except Exception as e:
-            print(f"  {YELLOW}[!] Error procesando {archivo}: {e}{RESET}")
+            resumen = resumir(leer_eventos(ruta))
+        except OSError as e:
+            print(f"  {YELLOW}[!] No se pudo leer {ruta.name}: {e}{RESET}")
             continue
 
-    registrar_filas_en_csv(filas_csv)
-    archivar_logs_en_zip(logs_a_comprimir)
-    purgar_zip_antiguos(dias=60)
-    imprimir_reporte(conteo, huerfanos, len(logs_a_comprimir))
+        # La fecha es la de la corrida (evento `inicio`), no la de la auditoría.
+        # Si el .jsonl se truncó antes del `inicio`, cae al mtime del archivo.
+        ts = resumen["ts"].replace("T", " ") or datetime.fromtimestamp(
+            ruta.stat().st_mtime
+        ).strftime("%Y-%m-%d %H:%M:%S")
 
-    # Aviso de posts_fallidos.json si existe
-    pf_path = os.path.join(os.path.dirname(AUDIT_CSV), "posts_fallidos.json")
-    if os.path.exists(pf_path):
-        try:
-            with open(pf_path, "r", encoding="utf-8") as f:
-                fallidos = json.load(f)
-            total = sum(len(v.get("skip", [])) for v in fallidos.values())
-            if total:
-                print(
-                    f"  {YELLOW}⚠️  Revisar posts_fallidos.json: {total} post(s) sugerido(s) en {len(fallidos)} URL(s){RESET}"
-                )
-                print(
-                    f"  {GRAY}   Copiar manualmente a skip_posts.json para aplicar{RESET}\n"
-                )
-        except Exception:
-            pass
+        filas.append(fila_csv(resumen, ts))
+        conteo[clasificar(resumen)] += 1
+        if not resumen["completo"]:
+            conteo["incompletos"] += 1
+
+        a_comprimir.append(ruta)
+        log_texto = ruta.with_suffix(".log")
+        if log_texto.exists():
+            a_comprimir.append(log_texto)
+
+    # .log sueltos sin su .jsonl: no generan fila (no hay eventos que resumir)
+    # pero se archivan igual, para que log_dir no los acumule para siempre.
+    sueltos = [p for p in log_dir.glob("*.log") if p not in a_comprimir]
+
+    registrar_filas_en_csv(cfg["audit_csv"], filas)
+    comprimidos = archivar_en_zip(log_dir, a_comprimir + sueltos)
+    purgados = purgar_zip_antiguos(log_dir)
+
+    imprimir_reporte(conteo, huerfanos, len(filas), len(sueltos), purgados)
+    avisar_posts_fallidos(cfg.get("posts_fallidos_file"))
+    return {"filas": len(filas), "comprimidos": comprimidos, "huerfanos": huerfanos}
+
+
+def avisar_posts_fallidos(ruta):
+    """Aviso al final del lote. La ruta viene del config, no se adivina."""
+    if not ruta or not Path(ruta).exists():
+        return
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            fallidos = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    total = sum(len(v.get("posts_con_error", [])) for v in fallidos.values())
+    if not total:
+        return
+    print(
+        f"  {YELLOW}⚠️  {total} post(s) con errores en {len(fallidos)} URL(s) "
+        f"— ver posts_fallidos.json{RESET}"
+    )
+    # NO dice "copiar a skip_posts.json": ese archivo espera la posición ordinal
+    # del post en el hilo, no su id. El link es el primer paso del workflow.
+    print(
+        f"  {GRAY}    Abrir el post_url y anotar en skip_posts.json el #N "
+        f"que muestra XenForo{RESET}\n"
+    )
 
 
 # =============================================================================
-# REPORTE VISUAL
+# REPORTE
 # =============================================================================
 
 
-def imprimir_reporte(conteo: dict, huerfanos: list, total_logs: int):
-    sep = "\\" if sys.platform == "win32" else "/"
+def imprimir_reporte(conteo: dict, huerfanos: list, total, sueltos=0, purgados=0):
     print(f"\n{BOLD}{'═' * 55}{RESET}")
     print(f"{BOLD}{MAGENTA}  REPORTE DE AUDITORÍA{RESET}")
     print(f"{GRAY}  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
     print(f"{BOLD}{'═' * 55}{RESET}\n")
 
-    print(f"  Logs procesados     : {BOLD}{total_logs}{RESET}")
-    print(f"  OK                  : {BOLD}{GREEN}{conteo['ok']}{RESET}")
-    print(f"  Transitorios        : {BOLD}{YELLOW}{conteo['transitorio']}{RESET}")
-    print(
-        f"  Timeout Sanando     : {BOLD}{CYAN}{conteo.get('timeout_sanando', 0)}{RESET} {GRAY}(Hilo gigante estable){RESET}"
-    )
-    print(
-        f"  Timeout Atascado    : {BOLD}{RED}{conteo.get('timeout_atascado', 0)}{RESET} {GRAY}(Host caído/Atascado){RESET}"
-    )
-    print(f"  Fatales             : {BOLD}{RED}{conteo['fatal']}{RESET}")
+    print(f"  Logs auditados      : {BOLD}{total}{RESET}")
+    print(f"  OK                  : {BOLD}{GREEN}{conteo['OK']}{RESET}")
+    print(f"  Transitorios        : {BOLD}{YELLOW}{conteo['TRANSITORIO']}{RESET}")
+    print(f"  Timeouts            : {BOLD}{CYAN}{conteo['TIMEOUT']}{RESET}")
+    print(f"  Fatales             : {BOLD}{RED}{conteo['FATAL']}{RESET}")
 
-    if conteo["sin_resumen"]:
+    if conteo.get("incompletos"):
         print(
-            f"  Sin [RESUMEN]       : {BOLD}{GRAY}{conteo['sin_resumen']}{RESET}"
-            f"  {GRAY}(proceso interrumpido — comprimidos sin registrar){RESET}"
+            f"  Sin cierre          : {BOLD}{GRAY}{conteo['incompletos']}{RESET}"
+            f"  {GRAY}(el proceso murió antes de terminar){RESET}"
+        )
+    if sueltos:
+        print(
+            f"  .log sin .jsonl     : {BOLD}{GRAY}{sueltos}{RESET}"
+            f"  {GRAY}(archivados sin auditar){RESET}"
+        )
+    if purgados:
+        print(
+            f"  ZIPs purgados       : {BOLD}{GRAY}{purgados}{RESET} {GRAY}(+60d){RESET}"
         )
 
     print()
 
     if huerfanos:
+        sep = "\\" if sys.platform == "win32" else "/"
         print(f"  {YELLOW}Archivos .part huérfanos: {len(huerfanos)}{RESET}")
         for path in huerfanos:
-            carpeta_vis = os.path.basename(os.path.dirname(path))
-            archivo_vis = os.path.basename(path)
+            p = Path(path)
             print(
-                f"    {RED}└──{RESET} {GRAY}...{sep}{carpeta_vis}{sep}{archivo_vis}{RESET}"
+                f"    {RED}└──{RESET} {GRAY}...{sep}{p.parent.name}{sep}{p.name}{RESET}"
             )
         print()
     else:
@@ -453,9 +519,9 @@ def imprimir_reporte(conteo: dict, huerfanos: list, total_logs: int):
     print(f"{BOLD}{'═' * 55}{RESET}\n")
 
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
+def main():
+    analizar_logs()
+
 
 if __name__ == "__main__":
-    analizar_logs()
+    main()
