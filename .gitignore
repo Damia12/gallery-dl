@@ -53,3 +53,4 @@ dump_*.json
 *.md
 !README.md
 CLAUDE.md
+_verificar/
