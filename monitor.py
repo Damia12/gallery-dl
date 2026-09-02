@@ -117,7 +117,6 @@ def es_ruta_local(ruta: str) -> bool:
                 import ctypes
 
                 drive = ruta[:2] + "\\"
-                # DRIVE_FIXED = 2, DRIVE_REMOTE = 4, DRIVE_RAMDISK = 6
                 drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive)
                 # 0 = UNKNOWN, 1 = NO_ROOT_DIR, 4 = REMOTE, 5 = CDROM → no local
                 # 2 = REMOVABLE, 3 = FIXED, 6 = RAMDISK → local
