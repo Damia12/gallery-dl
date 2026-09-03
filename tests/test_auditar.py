@@ -779,3 +779,23 @@ class TestAvisoPostsFallidos:
     def test_sin_archivo_no_dice_nada(self, tmp_path, capsys):
         auditar.avisar_posts_fallidos(tmp_path / "no_existe.json")
         assert capsys.readouterr().out == ""
+
+    def test_avisa_aunque_no_haya_logs_que_auditar(self, entorno, capsys):
+        """Los posts fallidos son un pendiente ACUMULADO, no un subproducto del
+        lote recién auditado.
+
+        `python auditar.py` sin logs pendientes es el uso donde el aviso más
+        importa —revisar qué quedó colgado— y era justo el que no lo mostraba:
+        analizar_logs() retornaba en el early return de "sin logs nuevos",
+        varias líneas antes de la llamada a avisar_posts_fallidos().
+        """
+        entorno["posts_fallidos_file"].write_text(
+            json.dumps({"https://x/1": {"posts_con_error": [11, 22, 33]}}),
+            encoding="utf-8",
+        )
+
+        auditar.analizar_logs(entorno)  # log_dir vacío: no hay nada que auditar
+
+        salida = capsys.readouterr().out
+        assert "Sin logs nuevos" in salida
+        assert "3 post(s)" in salida, "el aviso quedó del otro lado del return"

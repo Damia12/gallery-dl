@@ -412,11 +412,18 @@ def detectar_y_reportar_fallidos(
     else:
         thread_id, dominio = None, extraer_dominio(url)
 
-    # Determinar estado del fallo
+    # La razón sale del MISMO clasificador que llena el CSV: `res["estado"]` ya
+    # es `auditar.clasificar(resumen)`. Antes acá se recalculaba a mano y se
+    # escribía "fatal" cuando `errores > 0 and returncode != 0` — que es
+    # exactamente el predicado de TRANSITORIO en auditar.py. La misma corrida
+    # salía "fatal" en este JSON y TRANSITORIO en auditoria.csv; y leer "fatal"
+    # invita a skipear posts que se bajan bien al reintentar.
     if res["timeout"]:
-        estado = "timeout_atascado" if res["nuevos"] == 0 else "timeout_parcial"
+        # Único matiz que clasificar() no distingue, y no es un umbral
+        # inventado: o alcanzó a bajar algo antes de morir, o no bajó nada.
+        razon = "TIMEOUT_ATASCADO" if res["nuevos"] == 0 else "TIMEOUT_PARCIAL"
     elif res["errores"] > 0 and res["returncode"] != 0:
-        estado = "fatal"
+        razon = res["estado"]  # FATAL o TRANSITORIO, la misma palabra que el CSV
     else:
         return  # No reportar nada si está OK
 
@@ -435,7 +442,7 @@ def detectar_y_reportar_fallidos(
             ]
             if thread_id
             else [],
-            "razon": estado,
+            "razon": razon,
             "fecha": datetime.now().strftime("%Y-%m-%d"),
             "intentos": fallidos.get(url_key, {}).get("intentos", 0) + 1,
         }
@@ -459,25 +466,26 @@ def detectar_y_reportar_fallidos(
     # -------------------------------------------------------------------------
     posts_intentados = extraer_posts_desde_range(post_range)
     if not posts_intentados:
-        if estado in ("timeout_atascado", "timeout_parcial", "fatal"):
-            if url_key not in fallidos:
-                fallidos[url_key] = {
-                    "posts_con_error": [],
-                    "razon": estado,
-                    "fecha": datetime.now().strftime("%Y-%m-%d"),
-                    "intentos": 0,
-                    "nota": "Falló sin errores atribuibles a un post. Revisar el log.",
-                }
-            else:
-                fallidos[url_key]["razon"] = estado
-                fallidos[url_key]["fecha"] = datetime.now().strftime("%Y-%m-%d")
-                fallidos[url_key]["intentos"] = fallidos[url_key].get("intentos", 0) + 1
+        # Sin `if razon in (...)`: llegar hasta acá ya implica que la corrida no
+        # fue OK — el bloque de arriba retorna en ese caso.
+        if url_key not in fallidos:
+            fallidos[url_key] = {
+                "posts_con_error": [],
+                "razon": razon,
+                "fecha": datetime.now().strftime("%Y-%m-%d"),
+                "intentos": 0,
+                "nota": "Falló sin errores atribuibles a un post. Revisar el log.",
+            }
+        else:
+            fallidos[url_key]["razon"] = razon
+            fallidos[url_key]["fecha"] = datetime.now().strftime("%Y-%m-%d")
+            fallidos[url_key]["intentos"] = fallidos[url_key].get("intentos", 0) + 1
 
-            guardar_posts_fallidos(fallidos)
-            print(
-                f"  {YELLOW}[FALLIDOS] URL marcada para revision manual — "
-                f"revisar posts_fallidos.json{RESET}"
-            )
+        guardar_posts_fallidos(fallidos)
+        print(
+            f"  {YELLOW}[FALLIDOS] URL marcada para revision manual — "
+            f"revisar posts_fallidos.json{RESET}"
+        )
         return
 
     # -------------------------------------------------------------------------
@@ -499,7 +507,7 @@ def detectar_y_reportar_fallidos(
         url_key,
         {
             "ordinales_intentados": [],
-            "razon": estado,
+            "razon": razon,
             "fecha": datetime.now().strftime("%Y-%m-%d"),
             "intentos": 0,
         },
@@ -507,7 +515,7 @@ def detectar_y_reportar_fallidos(
     entrada["ordinales_intentados"] = sorted(
         set(entrada.get("ordinales_intentados", [])) | set(candidatos)
     )
-    entrada["razon"] = estado
+    entrada["razon"] = razon
     entrada["fecha"] = datetime.now().strftime("%Y-%m-%d")
     entrada["intentos"] = entrada.get("intentos", 0) + 1
 
@@ -1434,11 +1442,14 @@ def escribir_log_texto(
     resultado = extraer_thread_id(url)
     thread_id, dominio = resultado if resultado else (None, extraer_dominio(url))
 
-    # Agrupar los mensajes de error por post, en el orden en que ocurrieron.
-    por_post = {}
+    # Agrupar los mensajes por post, en el orden en que ocurrieron.
+    errores_por_post = {}
+    warnings_por_post = {}
     for e in eventos:
         if e.get("t") == "error":
-            por_post.setdefault(e.get("post_id"), []).append(e.get("msg", ""))
+            errores_por_post.setdefault(e.get("post_id"), []).append(e.get("msg", ""))
+        elif e.get("t") == "warning":
+            warnings_por_post.setdefault(e.get("post_id"), []).append(e.get("msg", ""))
 
     nuevos = [e["path"] for e in eventos if e.get("t") == "archivo" and e.get("nuevo")]
 
@@ -1470,9 +1481,9 @@ def escribir_log_texto(
         if rangos_skip:
             f.write(f"Posts omitidos: {', '.join(map(str, rangos_skip))}\n")
 
-        if por_post:
-            f.write("\nERRORES POR POST\n")
-            for post_id, msgs in por_post.items():
+        def escribir_grupo(titulo, grupos):
+            f.write(f"\n{titulo}\n")
+            for post_id, msgs in grupos.items():
                 etiqueta = f"post {post_id}" if post_id is not None else "sin post"
                 link = (
                     f"   https://{dominio}/threads/{thread_id}/post-{post_id}"
@@ -1483,8 +1494,25 @@ def escribir_log_texto(
                 f.write(f"       {msgs[0]}\n")
                 if len(msgs) > 1:
                     f.write(f"       (+{len(msgs) - 1} más)\n")
+
+        if errores_por_post:
+            escribir_grupo("ERRORES POR POST", errores_por_post)
         else:
             f.write("\nSin errores.\n")
+
+        # Warnings SIN un error del mismo post. Los que sí lo tienen ya se leen
+        # arriba: descarga.py fusiona la causa del warning dentro del mensaje
+        # del error. Estos no aparecían en ninguna parte —solo como número en
+        # el Resumen— y suelen decir algo que importa, como el
+        # "Unable to access premium content (type: paid)" de deviantart.
+        sueltos = {
+            pid: msgs
+            for pid, msgs in warnings_por_post.items()
+            if pid not in errores_por_post
+        }
+        if sueltos:
+            total = sum(len(m) for m in sueltos.values())
+            escribir_grupo(f"WARNINGS SIN ERROR ({total})", sueltos)
 
         if nuevos:
             f.write(f"\nARCHIVOS ({len(nuevos)})\n")

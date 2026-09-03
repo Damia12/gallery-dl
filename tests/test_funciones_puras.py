@@ -176,7 +176,7 @@ class TestClasificarPorTag:
         de keywords la contaba como warning porque contiene 'sleeping', lo
         que inflaba el conteo de warnings de cada hilo.
         """
-        linea = "[simpcity][debug] post 13501: Sleeping 1.00 seconds"
+        linea = "[simpcity][debug] post 4001: Sleeping 1.00 seconds"
         assert dsc.clasificar_por_tag(linea) == (False, False)
 
     def test_tag_info_es_ruido(self, dsc):
@@ -224,8 +224,8 @@ class TestLimpiarError:
 class TestExtraerThreadId:
 
     def test_url_simpcity_estandar(self, dsc):
-        res = dsc.extraer_thread_id("https://simpcity.cr/threads/hilo-ejemplo.10665/")
-        assert res == ("10665", "simpcity.cr")
+        res = dsc.extraer_thread_id("https://simpcity.cr/threads/hilo-ejemplo.99999/")
+        assert res == ("99999", "simpcity.cr")
 
     def test_conserva_el_dominio_real(self, dsc):
         """El dominio se propaga tal cual: no se normaliza a simpcity.cr."""
@@ -335,3 +335,167 @@ class TestEstado:
         actual = (dsc.TMP_PATH / "state.json").read_text(encoding="utf-8")
         assert actual == previo, "state.json quedó corrupto tras el crash"
         assert dsc.cargar_estado(["a"] * 10) == {"batch_index": 7}
+
+
+# =============================================================================
+# 8. detectar_y_reportar_fallidos: la palabra del reporte
+#    Fallo silencioso: posts_fallidos.json y auditoria.csv describen la misma
+#    corrida con palabras opuestas. Solo se nota leyendo los dos juntos, y para
+#    entonces ya skipeaste posts que el CSV daba por recuperables.
+# =============================================================================
+
+URL_HILO = "https://simpcity.cr/threads/hilo-ejemplo.99999/"
+
+
+def _res_desde_eventos(dsc, eventos):
+    """Arma el `res` igual que lo arma ejecutar_url(), desde los mismos eventos.
+
+    Partir del .jsonl y no de un dict a mano es lo que hace fuerte al test: si
+    alguien vuelve a hardcodear la razón, deja de coincidir con el clasificador
+    que llena el CSV y el assert falla.
+    """
+    resumen = dsc.auditar.resumir(eventos)
+    return {
+        "timeout": resumen["timeout"],
+        "nuevos": resumen["nuevos"],
+        "errores": resumen["errores"],
+        "returncode": resumen["returncode"],
+        "estado": dsc.auditar.clasificar(resumen),
+    }
+
+
+def _eventos(msg_error, returncode=4):
+    return [
+        {"t": "inicio", "url": URL_HILO, "nombre": "hilo-ejemplo.99999",
+         "ts": "2026-09-02T17:39:30"},
+        {"t": "archivo", "path": "a.jpg", "nuevo": True},
+        {"t": "warning", "post_id": 4001, "origen": "downloader.http",
+         "msg": "HTML response"},
+        {"t": "error", "post_id": 4001, "origen": "download", "msg": msg_error},
+        {"t": "fin", "duracion": 60, "returncode": returncode, "timeout": False},
+    ]
+
+
+def _leer_reporte(dsc):
+    ruta = dsc.TMP_PATH / "posts_fallidos.json"
+    return json.loads(ruta.read_text(encoding="utf-8"))[URL_HILO.rstrip("/")]
+
+
+class TestRazonDelReporte:
+
+    def test_dice_la_misma_palabra_que_el_csv(self, dsc):
+        """Forma del caso real del 2026-09-02: decenas de "HTML response".
+
+        El CSV decía TRANSITORIO y el reporte decía "fatal", porque acá se
+        recalculaba con `errores > 0 and returncode != 0` — que es exactamente
+        el predicado de TRANSITORIO en auditar.clasificar().
+        """
+        eventos = _eventos("Failed to download foto-1.jpg — HTML response")
+        res = _res_desde_eventos(dsc, eventos)
+        assert res["estado"] == "TRANSITORIO"  # lo que va al CSV
+
+        dsc.detectar_y_reportar_fallidos(URL_HILO, res, None, None, [4001])
+
+        assert _leer_reporte(dsc)["razon"] == res["estado"]
+
+    def test_un_fatal_de_verdad_sigue_diciendo_fatal(self, dsc):
+        """No alcanza con que coincidan: la razón tiene que seguir variando con
+        el error. Un 404 es irrecuperable y el reporte debe decirlo."""
+        eventos = _eventos("Failed to download foto.jpg — 404 Not Found")
+        res = _res_desde_eventos(dsc, eventos)
+        assert res["estado"] == "FATAL"
+
+        dsc.detectar_y_reportar_fallidos(URL_HILO, res, None, None, [4001])
+
+        assert _leer_reporte(dsc)["razon"] == "FATAL"
+
+    def test_el_timeout_conserva_su_matiz(self, dsc):
+        """clasificar() colapsa todo timeout en TIMEOUT. La distinción entre
+        morir sin bajar nada y morir a medio camino no es un umbral inventado
+        —o hay archivos o no los hay— y se mantiene."""
+        res = {"timeout": True, "nuevos": 0, "errores": 0,
+               "returncode": -9, "estado": "TIMEOUT"}
+        dsc.detectar_y_reportar_fallidos(URL_HILO, res, None, None, [4001])
+        assert _leer_reporte(dsc)["razon"] == "TIMEOUT_ATASCADO"
+
+        res["nuevos"] = 120
+        dsc.detectar_y_reportar_fallidos(URL_HILO, res, None, None, [4001])
+        assert _leer_reporte(dsc)["razon"] == "TIMEOUT_PARCIAL"
+
+    def test_una_corrida_ok_no_genera_reporte(self, dsc):
+        eventos = [
+            {"t": "inicio", "url": URL_HILO, "nombre": "x", "ts": "2026-09-02T00:00:00"},
+            {"t": "archivo", "path": "a.jpg", "nuevo": True},
+            {"t": "fin", "duracion": 10, "returncode": 0, "timeout": False},
+        ]
+        res = _res_desde_eventos(dsc, eventos)
+        assert res["estado"] == "OK"
+
+        dsc.detectar_y_reportar_fallidos(URL_HILO, res, None, None, [])
+
+        assert not (dsc.TMP_PATH / "posts_fallidos.json").exists()
+
+
+# =============================================================================
+# 9. escribir_log_texto: los warnings que no tienen error
+#    Fallo silencioso: el warning existe en el .jsonl y no aparece en el .log,
+#    que es lo que uno realmente lee. Solo se ve como un número en el Resumen.
+# =============================================================================
+
+class TestWarningsSinErrorEnElLog:
+
+    def _render(self, dsc, eventos):
+        ruta = dsc.TMP_PATH / "salida.log"
+        resumen = dsc.auditar.resumir(eventos)
+        dsc.escribir_log_texto(ruta, resumen["url"], resumen, eventos)
+        return ruta.read_text(encoding="utf-8")
+
+    def test_muestra_el_warning_que_no_tiene_error(self, dsc):
+        """deviantart avisa que hay contenido de pago que no bajó.
+        Sin error asociado, quedaba solo como "1 warnings" en el Resumen."""
+        eventos = [
+            {"t": "inicio", "url": "https://www.deviantart.com/alguien",
+             "nombre": "alguien", "ts": "2026-09-02T17:57:09"},
+            {"t": "archivo", "path": "a.jpg", "nuevo": True},
+            {"t": "warning", "post_id": None, "origen": "deviantart",
+             "msg": "Unable to access premium content (type: paid)"},
+            {"t": "fin", "duracion": 37, "returncode": 0, "timeout": False},
+        ]
+
+        texto = self._render(dsc, eventos)
+
+        assert "WARNINGS SIN ERROR (1)" in texto
+        assert "Unable to access premium content" in texto
+        assert "Sin errores." in texto  # sigue siendo una corrida sin errores
+
+    def test_no_repite_el_warning_ya_fusionado_en_su_error(self, dsc):
+        """descarga.py mete la causa del warning dentro del mensaje del error
+        del mismo post. Listarlo otra vez sería ruido duplicado: el post 4001
+        se lee arriba, y solo el 4002 —que nunca falló— es novedad."""
+        eventos = [
+            {"t": "inicio", "url": URL_HILO, "nombre": "hilo-ejemplo.99999",
+             "ts": "2026-09-02T17:39:30"},
+            {"t": "warning", "post_id": 4001, "origen": "downloader.http",
+             "msg": "HTML response"},
+            {"t": "error", "post_id": 4001, "origen": "download",
+             "msg": "Failed to download foto-1.jpg — HTML response"},
+            {"t": "warning", "post_id": 4002, "origen": "downloader.http",
+             "msg": "Read timed out. (1/7)"},
+            {"t": "fin", "duracion": 777, "returncode": 4, "timeout": False},
+        ]
+
+        texto = self._render(dsc, eventos)
+
+        assert "WARNINGS SIN ERROR (1)" in texto
+        assert "Read timed out" in texto
+        assert "post 4002" in texto
+        # El 4001 aparece una sola vez, en ERRORES POR POST.
+        assert texto.count("post 4001") == 1
+
+    def test_sin_warnings_no_aparece_la_seccion(self, dsc):
+        eventos = [
+            {"t": "inicio", "url": URL_HILO, "nombre": "x", "ts": "2026-09-02T00:00:00"},
+            {"t": "archivo", "path": "a.jpg", "nuevo": True},
+            {"t": "fin", "duracion": 10, "returncode": 0, "timeout": False},
+        ]
+        assert "WARNINGS SIN ERROR" not in self._render(dsc, eventos)

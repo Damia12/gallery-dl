@@ -403,6 +403,12 @@ def analizar_logs(cfg: dict | None = None) -> dict | None:
 
     if not jsonls and not huerfanos:
         print(f"\n  {GREEN}[+] Sin logs nuevos ni archivos .part huérfanos.{RESET}\n")
+        # El aviso también va acá: los posts fallidos son un pendiente
+        # ACUMULADO, no un subproducto del lote que se acaba de auditar. Este
+        # return cortaba antes de la llamada del final, así que correr
+        # `python auditar.py` para revisar (el uso documentado) contestaba
+        # "todo bien" teniendo posts anotados en el reporte.
+        avisar_posts_fallidos(cfg.get("posts_fallidos_file"))
         return None
 
     filas = []
