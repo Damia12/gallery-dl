@@ -5,7 +5,10 @@ Para ejecutar:
     pytest tests/test_monitor_hibrido.py -v --cov=monitor --cov-report=term-missing
 """
 
+import contextlib
+import io
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -479,3 +482,205 @@ class TestConcurrencia:
                 t.join()
             activos = monitor.tick()
             assert len(activos) == 10
+
+
+# =============================================================================
+# TESTS: dibujar_panel — el panel no puede desbordar su propio alto
+# =============================================================================
+
+
+class TestPanelNoDesborda:
+    """El panel se dibuja con filas ABSOLUTAS (`goto`). Si lo que escribe supera
+    el alto del panel de Windows Terminal (`--size 0.35`, unas 11 filas), el
+    salto de línea de la última fila hace scrollear el buffer: la cabecera sube,
+    lo ya dibujado sube con ella, y el frame siguiente vuelve a escribir en la
+    misma fila absoluta. Los frames viejos quedan en pantalla en vez de ser
+    sobrescritos — se veían .part ya terminados junto a 'Sin descarga activa'.
+    """
+
+    def _dibujar(self, activos, alto, carpeta=None, ancho=100):
+        mod = __import__(MONITOR_MODULE, fromlist=["dibujar_panel"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.dibujar_panel(
+                activos, {}, 0, "G:/Rips", "WATCHDOG", carpeta, alto=alto, ancho=ancho
+            )
+        return buf.getvalue()
+
+    @staticmethod
+    def _activos(n):
+        return [(f"G:/Rips/Simpcity/a{i}.jpg.part", f"a{i}.jpg.part", 1024) for i in range(n)]
+
+    def test_nunca_escribe_mas_filas_que_el_alto_del_panel(self):
+        salida = self._dibujar(self._activos(10), alto=12)
+        assert salida.count("\n") <= 11
+
+    @pytest.mark.parametrize("alto", [3, 8, 11, 12, 24, 60])
+    def test_el_cursor_nunca_baja_de_la_ultima_fila(self, alto):
+        """Cada salto de línea baja una fila desde la 1. Si el cursor pasa de la
+        última, el terminal scrollea y las filas absolutas dejan de valer."""
+        salida = self._dibujar(self._activos(10), alto=alto)
+        assert 1 + salida.count(chr(10)) <= alto
+
+    def test_avisa_de_los_archivos_que_no_caben(self):
+        salida = self._dibujar(self._activos(10), alto=12)
+        assert "más" in salida
+
+    def test_muestra_todos_los_archivos_si_caben(self):
+        salida = self._dibujar(self._activos(2), alto=40)
+        assert "a0.jpg.part" in salida and "a1.jpg.part" in salida
+        assert "más" not in salida
+
+    def test_repinta_la_cabecera_en_cada_frame(self):
+        """Sin repintar desde la fila 1, un solo scroll desalinea todo lo demás."""
+        salida = self._dibujar([], alto=24)
+        assert salida.startswith("\033[1;0H")
+        assert "MONITOR" in salida and "WATCHDOG" in salida
+
+    def test_borra_hasta_el_final_del_panel(self):
+        """Un frame con menos archivos que el anterior no puede dejar restos."""
+        assert self._dibujar([], alto=24).endswith("\033[J")
+
+
+# =============================================================================
+# TESTS: intervalo de refresco segun el modo
+# =============================================================================
+
+
+class TestIntervaloPorModo:
+    """En polling cada tick es un `os.walk()` que puede caer sobre un NAS, así
+    que el refresco rápido solo vale para watchdog, donde el tick lee un dict."""
+
+    def _mod(self):
+        return __import__(MONITOR_MODULE, fromlist=["intervalo_por_modo"])
+
+    def test_watchdog_refresca_rapido(self):
+        assert self._mod().intervalo_por_modo("WATCHDOG") == 0.25
+
+    def test_polling_se_queda_en_un_segundo(self):
+        assert self._mod().intervalo_por_modo("POLLING") == 1.0
+
+    def test_lo_pedido_por_linea_de_comandos_manda(self):
+        assert self._mod().intervalo_por_modo("WATCHDOG", 3.0) == 3.0
+        assert self._mod().intervalo_por_modo("POLLING", 0.1) == 0.1
+
+
+# =============================================================================
+# TESTS: la fila de descarga y la carpeta pegada
+# =============================================================================
+
+
+def _sin_ansi(texto):
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", texto)
+
+
+class TestCarpetaPegada:
+    """`gallery-dl_win.conf` trae `concurrent: 1`, así que entre archivo y
+    archivo no hay ningún .part activo. Con refresco de 0.25s, recalcular la
+    carpeta desde cero haría parpadear la línea una vez por archivo."""
+
+    def _mod(self):
+        return __import__(MONITOR_MODULE, fromlist=["carpeta_de"])
+
+    @staticmethod
+    def _act(ruta):
+        return [(ruta, os.path.basename(ruta), 1024)]
+
+    def test_sin_activos_conserva_la_ultima(self):
+        assert self._mod().carpeta_de([], "G:/Rips", "~/Simpcity/shoe0nhead/") == (
+            "~/Simpcity/shoe0nhead/"
+        )
+
+    def test_sin_activos_y_sin_previa_no_inventa(self):
+        assert self._mod().carpeta_de([], "G:/Rips") is None
+
+    def test_la_saca_del_part_activo(self):
+        act = self._act("G:/Rips/Simpcity/shoe0nhead/a.jpg.part")
+        assert self._mod().carpeta_de(act, "G:/Rips") == "~/Simpcity/shoe0nhead/"
+
+    def test_normaliza_las_barras_de_windows(self):
+        ruta = "G:" + chr(92) + "Rips" + chr(92) + "Simpcity" + chr(92) + "shoe0nhead" + chr(92) + "a.jpg.part"
+        act = self._act(ruta)
+
+    def test_cambia_al_saltar_de_hilo(self):
+        act = self._act("G:/Rips/Simpcity/olivia-sun/b.jpg.part")
+        previa = "~/Simpcity/shoe0nhead/"
+        assert self._mod().carpeta_de(act, "G:/Rips", previa) == "~/Simpcity/olivia-sun/"
+
+    def test_usa_el_mas_reciente_no_el_part_huerfano(self):
+        """activos viene ordenado por mtime descendente: el primero es el vivo."""
+        act = [
+            ("G:/Rips/Simpcity/olivia-sun/b.jpg.part", "b.jpg.part", 10),
+            ("G:/Rips/Simpcity/shoe0nhead/viejo.jpg.part", "viejo.jpg.part", 10),
+        ]
+        assert self._mod().carpeta_de(act, "G:/Rips") == "~/Simpcity/olivia-sun/"
+
+
+class TestFilaDeDescarga:
+    """Una fila por archivo, en columnas fijas. Un nombre que envolviera de
+    línea metería una fila extra y volvería a desalinear el panel entero."""
+
+    def _dibujar(self, activos, alto=24, ancho=100, carpeta=None):
+        mod = __import__(MONITOR_MODULE, fromlist=["dibujar_panel"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.dibujar_panel(
+                activos, {}, 0, "G:/Rips", "WATCHDOG", carpeta, alto=alto, ancho=ancho
+            )
+        return buf.getvalue()
+
+    def test_un_archivo_ocupa_una_sola_fila(self):
+        act = [("G:/Rips/a/uno.jpg.part", "uno.jpg.part", 1024)]
+        # 2 de cabecera + 1 de carpeta + 1 del archivo = 4 filas, 3 saltos
+        salida = self._dibujar(act, carpeta="~/a/")
+        assert _sin_ansi(salida).count("\n") == 3
+
+    def test_ninguna_fila_pasa_del_ancho(self):
+        largo = "x" * 120 + "_muy_largo.jpg.part"
+        act = [(f"G:/Rips/a/{largo}", largo, 1024)]
+        salida = _sin_ansi(self._dibujar(act, ancho=60, carpeta="~/a/"))
+        assert all(len(f) <= 60 for f in salida.split("\n"))
+
+    def test_el_nombre_se_recorta_por_el_principio(self):
+        """La cola lleva la extensión y el identificador; el principio no."""
+        largo = "prefijo_irrelevante_" * 6 + "12285-8cff76.mp4.part"
+        act = [(f"G:/Rips/a/{largo}", largo, 1024)]
+        salida = _sin_ansi(self._dibujar(act, ancho=70, carpeta="~/a/"))
+        assert "12285-8cff76.mp4.part" in salida
+        assert "prefijo_irrelevante_prefijo" not in salida
+
+    def test_la_carpeta_aparece_sobre_la_fila(self):
+        act = [("G:/Rips/Simpcity/shoe0nhead/a.jpg.part", "a.jpg.part", 1024)]
+        filas = _sin_ansi(self._dibujar(act, carpeta="~/Simpcity/shoe0nhead/")).split("\n")
+        i_carp = next(i for i, f in enumerate(filas) if "~/Simpcity/shoe0nhead/" in f)
+        i_arch = next(i for i, f in enumerate(filas) if "a.jpg.part" in f)
+        assert i_carp == i_arch - 1
+
+    def test_sin_carpeta_conocida_no_dibuja_la_fila(self):
+        """Al arrancar, antes del primer .part, no hay carpeta que mostrar."""
+        assert "~/" not in _sin_ansi(self._dibujar([], carpeta=None))
+
+
+class TestCabeceraRespetaElAncho:
+    """Si la cabecera no cabe a lo ancho, envuelve de línea y mete una fila
+    extra: el mismo desborde que `dibujar_panel()` existe para impedir."""
+
+    def _cab(self, ancho, rips="G:/Rips"):
+        mod = __import__(MONITOR_MODULE, fromlist=["lineas_cabecera"])
+        return _sin_ansi(mod.lineas_cabecera(rips, "WATCHDOG", ancho)[0])
+
+    @pytest.mark.parametrize("ancho", [12, 30, 40, 62, 120])
+    def test_nunca_pasa_del_ancho(self, ancho):
+        assert len(self._cab(ancho)) <= ancho
+
+    def test_suelta_el_ctrl_c_antes_de_recortar(self):
+        assert "Ctrl+C" not in self._cab(40)
+        assert "G:/Rips" in self._cab(40)
+
+    def test_suelta_la_ruta_si_tampoco_cabe(self):
+        cab = self._cab(30)
+        assert "G:/Rips" not in cab and "WATCHDOG" in cab
+
+    def test_con_una_ruta_larga_no_desborda(self):
+        largo = "G:/Rips/" + "carpeta_muy_larga/" * 8
+        assert len(self._cab(62, largo)) <= 62

@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -81,11 +82,6 @@ def fmt_bytes(b):
     if b >= 1024:
         return f"{b / 1024:.2f} KB"
     return f"{b} B"
-
-
-def ruta_corta(ruta_completa, rips_dir, maxlen=60):
-    rel = ruta_completa.replace(rips_dir, "").lstrip("\\/")
-    return ("..." + rel[-(maxlen - 3) :]) if len(rel) > maxlen else rel
 
 
 # =============================================================================
@@ -335,55 +331,156 @@ def crear_monitor(rips_dir: str):
 # =============================================================================
 # RENDERIZADO DE UI (compartido entre modos)
 # =============================================================================
-HEADER_LINES = 6  # +1 línea para el banner de modo
+def intervalo_por_modo(modo_str, pedido=None):
+    """Cada cuánto refrescar el panel, según el modo.
+
+    En WATCHDOG el tick solo lee un dict en memoria: refrescar cuatro veces por
+    segundo no cuesta nada, y hace visibles los archivos chicos —la mediana real
+    ronda los 98 KB, así que un `.part` vive menos que un ciclo de 1s y el panel
+    se lo perdía entre frame y frame. En POLLING cada tick es un `os.walk()`
+    sobre todo el árbol de Rips, que puede estar en un NAS: ahí se queda en 1s.
+
+    `pedido` (el `--intervalo` de la línea de comandos) manda si viene dado.
+    """
+    if pedido is not None:
+        return pedido
+    return 0.25 if modo_str == "WATCHDOG" else 1.0
 
 
-def dibujar_panel(activos, historiales, spin_idx, rips_dir, ultimas_filas, modo_str):
-    """Dibuja el panel de archivos .part activos."""
-    ahora = time.monotonic()
-    lineas = []
+def lineas_cabecera(rips_dir, modo_str, ancho=62):
+    """Una sola fila (más un separador en blanco), recortada al ancho del panel.
 
-    if not activos:
-        lineas.append(f"  {GRAY}Sin descarga activa — esperando .part...{RESET}")
-        lineas.append("")
+    La cabecera anterior ocupaba 6 filas de las ~11 que mide el panel de
+    Windows Terminal con `--size 0.35`: más de la mitad del alto gastada en
+    texto que nunca cambia. Y si no cabe a lo ancho tampoco sirve: al envolver
+    de línea metería una fila extra y desalinearía el panel entero, que es
+    justo lo que `dibujar_panel()` existe para impedir. Por eso va soltando
+    partes —primero el `Ctrl+C`, después la ruta— antes de recortar a lo bruto.
+    """
+    color_modo = GREEN if modo_str == "WATCHDOG" else YELLOW
+    util = max(10, min(60, ancho - 2))
+
+    for plana in (
+        f" MONITOR · {modo_str} · {rips_dir} · Ctrl+C ",
+        f" MONITOR · {modo_str} · {rips_dir} ",
+        f" MONITOR · {modo_str} ",
+    ):
+        if len(plana) <= util:
+            break
     else:
-        for ruta, nombre, tamanio in activos:
-            rel = ruta_corta(ruta, rips_dir)
-            hist = historiales.get(ruta, deque())
+        plana = plana[:util]
 
-            hist.append((ahora, tamanio))
-            while hist and (ahora - hist[0][0]) > VENTANA_VEL:
-                hist.popleft()
+    barras = util - len(plana)
+    izq, der = barras // 2, barras - barras // 2
+    etiqueta = plana.replace(modo_str, f"{color_modo}{modo_str}{RESET}{CYAN}{BOLD}", 1)
+    return [f"{CYAN}{BOLD}  {'═' * izq}{etiqueta}{'═' * der}{RESET}", ""]
 
-            vel_str = "—"
-            color = YELLOW
-            spin = "⏸"
-            if len(hist) >= 2:
-                t0, s0 = hist[0]
-                delta_t = ahora - t0
-                delta_b = tamanio - s0
-                if delta_t > 0 and delta_b > 0:
-                    vel_str = fmt_bytes(delta_b / delta_t) + "/s"
-                    color = GREEN
-                    spin = SPINNERS[spin_idx % len(SPINNERS)]
 
-            lineas.append(f"  {GRAY}📄{RESET} {YELLOW}{rel}{RESET}")
-            lineas.append(
-                f"  {color}{spin}{RESET}  {BOLD}{fmt_bytes(tamanio)}{RESET} descargados   {color}{vel_str}{RESET}"
-            )
-            lineas.append("")
+def acortar_nombre(nombre, maxlen):
+    """Recorta por el principio: la cola lleva la extensión y el identificador."""
+    return nombre if len(nombre) <= maxlen else "…" + nombre[-(maxlen - 1) :]
 
-    filas_necesarias = len(lineas)
-    filas_a_borrar = max(0, ultimas_filas - filas_necesarias)
 
-    goto(HEADER_LINES + 1)
-    for linea in lineas:
-        sys.stdout.write(f"{CLEAR}{linea}\n")
-    for _ in range(filas_a_borrar):
-        sys.stdout.write(f"{CLEAR}\n")
+def carpeta_de(activos, rips_dir, previa=None):
+    """Carpeta del `.part` que se está bajando, relativa a Rips (`~/` es Rips).
 
+    Se queda **pegada** a la anterior cuando no hay nada activo. Entre archivo y
+    archivo hay huecos de menos de un segundo, y con refresco de 0.25s la línea
+    parpadearía una vez por archivo; la carpeta solo cambia al saltar de hilo,
+    así que pegada es una línea quieta. `activos` viene ordenado por mtime
+    descendente, así que el primero es el que de verdad está bajando: si quedó
+    un `.part` huérfano de otro hilo esperando a vencer, no se roba la fila.
+    """
+    if not activos:
+        return previa
+    carpeta = os.path.dirname(activos[0][0]).replace("\\", "/")
+    raiz = rips_dir.replace("\\", "/").rstrip("/")
+    if carpeta.lower().startswith(raiz.lower()):
+        carpeta = carpeta[len(raiz) :]
+    carpeta = carpeta.strip("/")
+    return f"~/{carpeta}/" if carpeta else "~/"
+
+
+def dibujar_panel(
+    activos, historiales, spin_idx, rips_dir, modo_str, carpeta=None, alto=None, ancho=None
+):
+    r"""Repinta el panel entero desde la fila 1, sin pasarse de su alto.
+
+    Las tres reglas de acá son el arreglo de un bug real. El panel de Windows
+    Terminal mide ~11 filas (`--size 0.35`) y con dos .part activos el dibujo
+    necesitaba 13: el salto de línea de la última fila scrolleaba el buffer, así
+    que la cabecera y lo ya dibujado subían una fila mientras el `goto()` del
+    frame siguiente seguía apuntando a la misma fila ABSOLUTA. Cada frame se
+    escribía debajo del anterior en vez de encima, y quedaban en pantalla .part
+    ya terminados conviviendo con el cartel de que no había nada bajando.
+
+      1. Se repinta también la cabecera: el frame no depende de que nada se
+         haya movido, ni de cuántas líneas quedaron impresas antes del bucle.
+      2. Se recorta a lo que cabe —de alto y de ancho— y no se emite el "\n"
+         final, así el terminal nunca scrollea. Un nombre largo que envolviera
+         de línea metería una fila extra y volvería a desalinear todo.
+      3. Cierra con ED0 ("\033[J"), que borra de ahí al final de la pantalla:
+         un frame más corto que el anterior no puede dejar restos, y ya no hace
+         falta llevar la cuenta de las filas del frame previo.
+
+    Una fila por archivo, en columnas fijas. `gallery-dl_win.conf` trae
+    `"concurrent": 1`, así que en la práctica hay un solo `.part` a la vez: el
+    recorte por cantidad casi nunca se usa, pero tiene que estar bien igual.
+    """
+    if alto is None:
+        alto = shutil.get_terminal_size(fallback=(80, 24)).lines
+    if ancho is None:
+        ancho = shutil.get_terminal_size(fallback=(80, 24)).columns
+
+    ahora = time.monotonic()
+    libre = max(20, ancho - 29)  # lo que queda para el nombre tras las columnas
+    filas = []
+
+    for ruta, nombre, tamanio in activos:
+        hist = historiales.get(ruta, deque())
+
+        hist.append((ahora, tamanio))
+        while hist and (ahora - hist[0][0]) > VENTANA_VEL:
+            hist.popleft()
+
+        vel_str = "—"
+        color = YELLOW
+        spin = "⏸"
+        if len(hist) >= 2:
+            t0, s0 = hist[0]
+            delta_t = ahora - t0
+            delta_b = tamanio - s0
+            if delta_t > 0 and delta_b > 0:
+                vel_str = fmt_bytes(delta_b / delta_t) + "/s"
+                color = GREEN
+                spin = SPINNERS[spin_idx % len(SPINNERS)]
+
+        filas.append(
+            f"  {color}{spin}{RESET} {BOLD}{fmt_bytes(tamanio):>9}{RESET}  "
+            f"{color}{vel_str:>9}{RESET}   {YELLOW}{acortar_nombre(nombre, libre)}{RESET}"
+        )
+
+    if not filas:
+        filas.append(f"  {GRAY}esperando .part...{RESET}")
+
+    fijas = lineas_cabecera(rips_dir, modo_str, ancho)
+    if carpeta:
+        fijas.append(f"  {CYAN}{carpeta}{RESET}")
+
+    tope = max(1, alto - 1)  # la última fila queda libre: sin salto de línea final
+    lineas = fijas + filas
+
+    if len(lineas) > tope:
+        caben = max(0, tope - len(fijas) - 1)  # una fila se va en el aviso
+        lineas = fijas + filas[:caben]
+        lineas.append(f"  {GRAY}… +{len(filas) - caben} archivo(s) más{RESET}")
+        del lineas[tope:]  # si ni la cabecera cabe, se corta igual
+
+    goto(1)
+    sys.stdout.write("\n".join(f"{CLEAR}{linea}" for linea in lineas))
+    sys.stdout.write("\033[J")
     sys.stdout.flush()
-    return filas_necesarias
+    return len(lineas)
 
 
 # =============================================================================
@@ -392,7 +489,7 @@ def dibujar_panel(activos, historiales, spin_idx, rips_dir, ultimas_filas, modo_
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rips-dir", default=RIPS_DIR)
-    parser.add_argument("--intervalo", default=1, type=float)
+    parser.add_argument("--intervalo", default=None, type=float)
     args = parser.parse_args()
 
     CENTINELA = os.path.join(
@@ -400,7 +497,6 @@ def main():
     )
 
     rips_dir = args.rips_dir
-    intervalo = args.intervalo
 
     if IS_WINDOWS:
         os.system("")  # activar ANSI
@@ -411,22 +507,16 @@ def main():
 
     # Crear monitor (auto-detecta watchdog vs polling)
     monitor = crear_monitor(rips_dir)
+    intervalo = intervalo_por_modo(monitor.modo_str, args.intervalo)
 
+    # La cabecera ya no se imprime acá: la dibuja cada frame junto al panel,
+    # así el banner de crear_monitor() —que en Windows Terminal sobrevive al
+    # borrado de pantalla— no puede correr las filas del panel hacia abajo.
     sys.stdout.write("\033[2J\033[H")
-    print(f"{CYAN}{BOLD}  {'═' * 58}{RESET}")
-    print(f"{CYAN}{BOLD}  MONITOR DE DESCARGA ACTIVA{RESET}")
-    print(f"{GRAY}  Dir: {rips_dir}{RESET}")
-    print(f"{GRAY}  Ventana activa: {VENTANA_ACTIVO}s | Ctrl+C para salir{RESET}")
-    if monitor.modo_str == "WATCHDOG":
-        color_modo = GREEN  # ✅ Eficiente: eventos push del kernel
-    else:
-        color_modo = YELLOW  # ⚠️ Fallback: os.walk() cada 1s
-
-    print(f"{color_modo}{BOLD}  [{monitor.modo_str}]{RESET}")
-    print(f"{CYAN}{BOLD}  {'═' * 58}{RESET}")
     sys.stdout.flush()
 
     spin_idx = 0
+    carpeta = None  # se queda pegada a la última vista: ver carpeta_de()
     ultimas_filas = 0
 
     TIEMPO_MAXIMO_SIN_CENTINELA_NUEVO = 7200  # 2 horas
@@ -462,13 +552,14 @@ def main():
                 if r not in rutas_activas:
                     del monitor.historiales[r]
 
+            carpeta = carpeta_de(activos, rips_dir, carpeta)
             ultimas_filas = dibujar_panel(
                 activos,
                 monitor.historiales,
                 spin_idx,
                 rips_dir,
-                ultimas_filas,
                 monitor.modo_str,
+                carpeta,
             )
             spin_idx += 1
             time.sleep(intervalo)
@@ -477,7 +568,7 @@ def main():
         pass
     finally:
         show_cursor()
-        goto(HEADER_LINES + ultimas_filas + 2)
+        goto(ultimas_filas + 1)
         if motivo_cierre == "stale":
             print(
                 f"{YELLOW}  [!] El monitor se cerro porque descarga.running no se "
