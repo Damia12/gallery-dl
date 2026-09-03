@@ -1523,8 +1523,29 @@ def escribir_log_texto(
 # =============================================================================
 # EJECUTOR DE URL
 # =============================================================================
+def nombre_de_log(url: str) -> str:
+    """Nombre del .log y el .jsonl de una URL. Regla única, no se recalcula.
+
+    Se acorta conservando principio Y final. Un `[:60]` a secas tiraba
+    justo la parte que identifica el hilo: en XenForo el tramo final es
+    `{slug-largo-y-descriptivo}.{thread_id}`, y el slug puede repetirse entre
+    hilos distintos mientras que el id no. Con el recorte por prefijo, dos
+    hilos reales de `lista.txt` —73 caracteres de slug idéntico, thread_id
+    distinto— colapsaban al mismo nombre:
+
+        {slug-de-73-chars}.1111111  ->  {los-primeros-60-chars}
+        {slug-de-73-chars}.2222222  ->  {los-primeros-60-chars}
+
+    Si dos URLs así caen en el mismo lote, `EventLog` abre el .jsonl con "w" y
+    la segunda corrida trunca la primera: esa descarga desaparece del CSV sin
+    ningún aviso. El `~` marca que hubo corte.
+    """
+    n = re.sub(r'[\\/*?:"<>|]', "_", url.rstrip("/").split("/")[-1])
+    return n if len(n) <= 60 else f"{n[:44]}~{n[-15:]}"
+
+
 def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
-    nombre = re.sub(r'[\\/*?:"<>|]', "_", url.rstrip("/").split("/")[-1])[:60]
+    nombre = nombre_de_log(url)
     log_path = PATHS["log_dir"] / f"{nombre}.log"
     jsonl_path = PATHS["log_dir"] / f"{nombre}.jsonl"
     PATHS["log_dir"].mkdir(parents=True, exist_ok=True)
@@ -1636,7 +1657,7 @@ def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
 # =============================================================================
 # PROCESADOR DE LOTE
 # =============================================================================
-def _imprimir_resumen_url(res: dict):
+def _imprimir_resumen_url(res: dict, url: str | None = None):
     nombre = res["nombre"]
     nuevos = res["nuevos"]
     done = res["done"]
@@ -1648,9 +1669,11 @@ def _imprimir_resumen_url(res: dict):
     print()
 
     if res["timeout"]:
-        print(
-            f"  {RED}[T] {nombre} — timeout ({TIMEOUT_ACTIVIDAD}s sin actividad){RESET}"
-        )
+        # El timeout real depende del host: simpcity y bunkr esperan 7200s, no
+        # los 900s de la constante base. Imprimir TIMEOUT_ACTIVIDAD fijo decía
+        # "900s" para una descarga que estuvo dos horas colgada.
+        limite = obtener_timeout_por_url(url) if url else TIMEOUT_ACTIVIDAD
+        print(f"  {RED}[T] {nombre} — timeout ({limite}s sin actividad){RESET}")
     elif res["errores"] > 0:
         print(
             f"  {RED}[X] {nombre} — {resumen}{warn_str} — {res['errores']} error(es) (ver log) — {tiempo_str}{RESET}"
@@ -1702,7 +1725,10 @@ def procesar_lote(lote: list):
         try:
             res = ejecutar_url(url, skip_posts=skip_posts)
         except Exception as e:
-            nombre_err = url.rstrip("/").split("/")[-1][:60]
+            # La misma regla que el camino normal: acá se duplicaba (y sin el
+            # re.sub de caracteres inválidos), así que un fallo podía escribir
+            # su .jsonl con un nombre distinto al que habría tenido si andaba.
+            nombre_err = nombre_de_log(url)
             print(
                 f"\n  {RED}[X] Excepcion no controlada procesando {nombre_err}: {e}{RESET}"
             )
@@ -1748,7 +1774,7 @@ def procesar_lote(lote: list):
                 "duracion": 0,
                 "returncode": -1,
             }
-        _imprimir_resumen_url(res)
+        _imprimir_resumen_url(res, url)
 
         totales["nuevos"] += res["nuevos"]
         totales["done"] += res["done"]

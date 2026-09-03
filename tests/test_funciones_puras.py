@@ -499,3 +499,82 @@ class TestWarningsSinErrorEnElLog:
             {"t": "fin", "duracion": 10, "returncode": 0, "timeout": False},
         ]
         assert "WARNINGS SIN ERROR" not in self._render(dsc, eventos)
+
+
+# =============================================================================
+# 10. nombre_de_log
+#     Fallo silencioso: dos URLs distintas que colapsan al mismo nombre. Si caen
+#     en el mismo lote, EventLog abre el .jsonl con "w" y la segunda corrida
+#     trunca la primera — esa descarga desaparece del CSV sin ningún aviso.
+# =============================================================================
+
+class TestNombreDeLog:
+
+    # Caso real de lista.txt: dos hilos distintos cuyo slug coincide en los
+    # primeros 73 caracteres y solo se separan en el thread_id final.
+    URL_A = ("https://simpcity.cr/threads/"
+             "hilo-muy-largo-de-ejemplo-con-slug-repetido-vendedor-9772.1539962/")
+    URL_B = ("https://simpcity.cr/threads/"
+             "hilo-muy-largo-de-ejemplo-con-slug-repetido-vendedor-9772.1586708/")
+
+    def test_dos_hilos_con_el_mismo_slug_no_colisionan(self, dsc):
+        """Con `[:60]` a secas ambos daban el mismo nombre: el corte caía antes
+        del punto que separa los thread_id."""
+        a, b = dsc.nombre_de_log(self.URL_A), dsc.nombre_de_log(self.URL_B)
+        assert a != b, f"colisión: ambas URLs dan {a!r}"
+
+    def test_conserva_el_thread_id(self, dsc):
+        """El id es lo único que identifica el hilo sin ambigüedad; el slug
+        puede repetirse. Truncar por prefijo tiraba justo esa parte."""
+        assert dsc.nombre_de_log(self.URL_A).endswith("1539962")
+        assert dsc.nombre_de_log(self.URL_B).endswith("1586708")
+
+    def test_respeta_el_limite_de_60(self, dsc):
+        assert len(dsc.nombre_de_log(self.URL_A)) == 60
+
+    def test_un_nombre_corto_queda_intacto(self, dsc):
+        """Sin corte no hay marca `~`: la inmensa mayoría de las URLs (229 de
+        235 en la lista real) pasan por acá sin tocarse."""
+        assert dsc.nombre_de_log("https://www.deviantart.com/alguien") == "alguien"
+        assert dsc.nombre_de_log("https://simpcity.cr/threads/corto.123/") == "corto.123"
+
+    def test_limpia_los_caracteres_invalidos_de_windows(self, dsc):
+        """Se perdía en el camino del except, que truncaba sin el re.sub."""
+        assert dsc.nombre_de_log('https://x/a:b*c?d"e') == "a_b_c_d_e"
+
+    def test_es_determinista(self, dsc):
+        """La misma URL siempre da el mismo nombre: si no, un reintento
+        escribiría un .jsonl nuevo en vez de reemplazar el anterior."""
+        assert dsc.nombre_de_log(self.URL_A) == dsc.nombre_de_log(self.URL_A)
+        # La barra final no cambia el nombre (lista.txt las tiene mezcladas).
+        assert dsc.nombre_de_log(self.URL_A) == dsc.nombre_de_log(self.URL_A.rstrip("/"))
+
+
+# =============================================================================
+# 11. El número del mensaje de timeout
+#     El proyecto no testea formateo de pantalla porque su fallo se ve al
+#     instante. Este es la excepción: un "900s" es perfectamente creíble, así
+#     que decir el timeout equivocado NO se nota — manda a diagnosticar mal una
+#     descarga que en realidad estuvo dos horas colgada.
+# =============================================================================
+
+class TestMensajeDeTimeout:
+
+    def _res(self):
+        return {"nombre": "x", "nuevos": 0, "done": 0, "warnings": 0,
+                "errores": 0, "duracion": 7200, "timeout": True}
+
+    def test_un_host_lento_reporta_su_timeout_extendido(self, dsc, capsys):
+        dsc._imprimir_resumen_url(self._res(), "https://simpcity.cr/threads/x.1/")
+        salida = capsys.readouterr().out
+        assert str(dsc.TIMEOUT_ACTIVIDAD_LENTO) in salida
+        assert str(dsc.TIMEOUT_ACTIVIDAD) not in salida
+
+    def test_un_host_normal_reporta_el_timeout_base(self, dsc, capsys):
+        dsc._imprimir_resumen_url(self._res(), "https://www.deviantart.com/alguien")
+        assert str(dsc.TIMEOUT_ACTIVIDAD) in capsys.readouterr().out
+
+    def test_sin_url_cae_al_timeout_base(self, dsc, capsys):
+        """El camino del except arma el `res` a mano y puede no traer la URL."""
+        dsc._imprimir_resumen_url(self._res())
+        assert str(dsc.TIMEOUT_ACTIVIDAD) in capsys.readouterr().out
