@@ -587,33 +587,33 @@ class TestCarpetaPegada:
         return [(ruta, os.path.basename(ruta), 1024)]
 
     def test_sin_activos_conserva_la_ultima(self):
-        assert self._mod().carpeta_de([], "G:/Rips", "~/Simpcity/shoe0nhead/") == (
-            "~/Simpcity/shoe0nhead/"
+        assert self._mod().carpeta_de([], "G:/Rips", "~/Simpcity/hilo-ejemplo/") == (
+            "~/Simpcity/hilo-ejemplo/"
         )
 
     def test_sin_activos_y_sin_previa_no_inventa(self):
         assert self._mod().carpeta_de([], "G:/Rips") is None
 
     def test_la_saca_del_part_activo(self):
-        act = self._act("G:/Rips/Simpcity/shoe0nhead/a.jpg.part")
-        assert self._mod().carpeta_de(act, "G:/Rips") == "~/Simpcity/shoe0nhead/"
+        act = self._act("G:/Rips/Simpcity/hilo-ejemplo/a.jpg.part")
+        assert self._mod().carpeta_de(act, "G:/Rips") == "~/Simpcity/hilo-ejemplo/"
 
     def test_normaliza_las_barras_de_windows(self):
-        ruta = "G:" + chr(92) + "Rips" + chr(92) + "Simpcity" + chr(92) + "shoe0nhead" + chr(92) + "a.jpg.part"
+        ruta = "G:" + chr(92) + "Rips" + chr(92) + "Simpcity" + chr(92) + "hilo-ejemplo" + chr(92) + "a.jpg.part"
         act = self._act(ruta)
 
     def test_cambia_al_saltar_de_hilo(self):
-        act = self._act("G:/Rips/Simpcity/olivia-sun/b.jpg.part")
-        previa = "~/Simpcity/shoe0nhead/"
-        assert self._mod().carpeta_de(act, "G:/Rips", previa) == "~/Simpcity/olivia-sun/"
+        act = self._act("G:/Rips/Simpcity/otro-hilo/b.jpg.part")
+        previa = "~/Simpcity/hilo-ejemplo/"
+        assert self._mod().carpeta_de(act, "G:/Rips", previa) == "~/Simpcity/otro-hilo/"
 
     def test_usa_el_mas_reciente_no_el_part_huerfano(self):
         """activos viene ordenado por mtime descendente: el primero es el vivo."""
         act = [
-            ("G:/Rips/Simpcity/olivia-sun/b.jpg.part", "b.jpg.part", 10),
-            ("G:/Rips/Simpcity/shoe0nhead/viejo.jpg.part", "viejo.jpg.part", 10),
+            ("G:/Rips/Simpcity/otro-hilo/b.jpg.part", "b.jpg.part", 10),
+            ("G:/Rips/Simpcity/hilo-ejemplo/viejo.jpg.part", "viejo.jpg.part", 10),
         ]
-        assert self._mod().carpeta_de(act, "G:/Rips") == "~/Simpcity/olivia-sun/"
+        assert self._mod().carpeta_de(act, "G:/Rips") == "~/Simpcity/otro-hilo/"
 
 
 class TestFilaDeDescarga:
@@ -650,9 +650,9 @@ class TestFilaDeDescarga:
         assert "prefijo_irrelevante_prefijo" not in salida
 
     def test_la_carpeta_aparece_sobre_la_fila(self):
-        act = [("G:/Rips/Simpcity/shoe0nhead/a.jpg.part", "a.jpg.part", 1024)]
-        filas = _sin_ansi(self._dibujar(act, carpeta="~/Simpcity/shoe0nhead/")).split("\n")
-        i_carp = next(i for i, f in enumerate(filas) if "~/Simpcity/shoe0nhead/" in f)
+        act = [("G:/Rips/Simpcity/hilo-ejemplo/a.jpg.part", "a.jpg.part", 1024)]
+        filas = _sin_ansi(self._dibujar(act, carpeta="~/Simpcity/hilo-ejemplo/")).split("\n")
+        i_carp = next(i for i, f in enumerate(filas) if "~/Simpcity/hilo-ejemplo/" in f)
         i_arch = next(i for i, f in enumerate(filas) if "a.jpg.part" in f)
         assert i_carp == i_arch - 1
 
