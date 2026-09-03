@@ -1617,10 +1617,12 @@ def ejecutar_url(url: str, skip_posts: dict | None = None) -> dict:
         "duracion": duracion,
         "returncode": returncode,
         "estado": auditar.clasificar(resumen),
-        "archivos": archivos,
-        "errs": errs,
-        "warns": warns,
     }
+    # `archivos`, `errs` y `warns` (las listas crudas) NO van acá: nadie las
+    # leía, y ofrecerlas invita a contar con `len()` en vez de usar el resumen.
+    # `archivos` además no está deduplicada —gallery-dl puede repetir una ruta
+    # en stdout y `resumir()` la cuenta una sola vez—, así que el número fácil
+    # de obtener sería el equivocado. Lo que quedó en el .jsonl es la fuente.
 
     # Reportar posts candidatos a fallidos (no se aplica automáticamente)
     detectar_y_reportar_fallidos(url, res, post_range, rangos_skip, posts_con_error)

@@ -11,6 +11,7 @@ etiqueta equivocada en un CSV que nadie mira hasta que importa.
 
 import csv
 import json
+import re
 import zipfile
 from datetime import datetime
 
@@ -761,6 +762,44 @@ class TestMantenimiento:
         # log_dir inexistente -> zipfile no puede crear el archivo
         assert auditar.archivar_en_zip(tmp_path / "no" / "existe", [origen]) == 0
         assert origen.exists()
+
+    def test_el_nombre_en_el_zip_lleva_la_hora_de_la_corrida(self, entorno):
+        """Con el sello del archivado, las corridas de un mismo lote entraban
+        todas con el mismo prefijo y el ZIP no decía en qué orden ocurrieron."""
+        poner_log(entorno, "temprano",
+                  [ev_inicio(nombre="temprano", ts="2026-09-02T17:39:30"), ev_fin()])
+        poner_log(entorno, "tarde",
+                  [ev_inicio(nombre="tarde", ts="2026-09-02T17:57:09"), ev_fin()])
+
+        auditar.analizar_logs(entorno)
+
+        zips = list(entorno["log_dir"].glob("logs_*.zip"))
+        with zipfile.ZipFile(zips[0]) as z:
+            nombres = sorted(z.namelist())
+
+        assert nombres == [
+            "173930_temprano.jsonl",
+            "173930_temprano.log",
+            "175709_tarde.jsonl",
+            "175709_tarde.log",
+        ], "el orden alfabético del ZIP debe ser el cronológico de las corridas"
+
+    def test_un_log_suelto_sin_jsonl_cae_a_la_hora_de_archivado(self, entorno):
+        """No hay evento `inicio` del cual leer el ts, así que lo único que se
+        sabe de él es cuándo se archivó. No debe romper por eso."""
+        (entorno["log_dir"] / "huerfano.log").write_text("vista", encoding="utf-8")
+        poner_log(entorno, "normal",
+                  [ev_inicio(nombre="normal", ts="2026-09-02T17:39:30"), ev_fin()])
+
+        auditar.analizar_logs(entorno)
+
+        with zipfile.ZipFile(next(entorno["log_dir"].glob("logs_*.zip"))) as z:
+            nombres = z.namelist()
+
+        assert "173930_normal.jsonl" in nombres
+        suelto = [n for n in nombres if n.endswith("huerfano.log")]
+        assert len(suelto) == 1
+        assert re.fullmatch(r"\d{6}_huerfano\.log", suelto[0])
 
 
 class TestAvisoPostsFallidos:

@@ -323,21 +323,28 @@ def registrar_filas_en_csv(csv_path, filas: list):
 # =============================================================================
 
 
-def archivar_en_zip(log_dir, rutas: list) -> int:
+def archivar_en_zip(log_dir, rutas: list, prefijos: dict | None = None) -> int:
     """Comprime los logs del lote en el ZIP del día y los borra del directorio.
 
     Entran el .jsonl y el .log de cada URL: el .jsonl es el dato y el .log es la
     vista, y archivar solo uno dejaría la mitad de la corrida sin respaldo.
+
+    `prefijos` mapea ruta -> HHMMSS de la CORRIDA (sale del evento `inicio`).
+    Sin él, las cinco corridas de un lote entraban al ZIP con el mismo sello —el
+    del archivado— y adentro no se veía en qué orden ocurrieron. Lo que no está
+    en el mapa (un .log suelto, sin .jsonl del cual leer el ts) cae a la hora de
+    archivado, que es lo único que se sabe de él.
     """
     rutas = [Path(r) for r in rutas if Path(r).exists()]
     if not rutas:
         return 0
+    prefijos = prefijos or {}
     zip_file = Path(log_dir) / f"logs_{datetime.now().strftime('%Y-%m-%d')}.zip"
     try:
         with zipfile.ZipFile(zip_file, "a", compression=zipfile.ZIP_DEFLATED) as z:
-            ts = datetime.now().strftime("%H%M%S")
+            ahora = datetime.now().strftime("%H%M%S")
             for ruta in rutas:
-                z.write(ruta, arcname=f"{ts}_{ruta.name}")
+                z.write(ruta, arcname=f"{prefijos.get(str(ruta), ahora)}_{ruta.name}")
     except OSError as e:
         print(f"  {RED}[X] Error comprimiendo logs: {e}{RESET}")
         return 0
@@ -413,6 +420,7 @@ def analizar_logs(cfg: dict | None = None) -> dict | None:
 
     filas = []
     a_comprimir = []
+    prefijos = {}  # ruta -> HHMMSS de la corrida, para el nombre dentro del ZIP
     conteo = dict.fromkeys(ESTADOS, 0)
     conteo["incompletos"] = 0
 
@@ -439,12 +447,17 @@ def analizar_logs(cfg: dict | None = None) -> dict | None:
         if log_texto.exists():
             a_comprimir.append(log_texto)
 
+        # Misma hora para el par .jsonl/.log: quedan juntos al ordenar el ZIP.
+        hhmmss = ts[11:19].replace(":", "")
+        prefijos[str(ruta)] = hhmmss
+        prefijos[str(log_texto)] = hhmmss
+
     # .log sueltos sin su .jsonl: no generan fila (no hay eventos que resumir)
     # pero se archivan igual, para que log_dir no los acumule para siempre.
     sueltos = [p for p in log_dir.glob("*.log") if p not in a_comprimir]
 
     registrar_filas_en_csv(cfg["audit_csv"], filas)
-    comprimidos = archivar_en_zip(log_dir, a_comprimir + sueltos)
+    comprimidos = archivar_en_zip(log_dir, a_comprimir + sueltos, prefijos)
     purgados = purgar_zip_antiguos(log_dir)
 
     imprimir_reporte(conteo, huerfanos, len(filas), len(sueltos), purgados)
