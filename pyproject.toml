@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pipeline-forense-descarga"
-version = "3.2.1"
+version = "3.3.0"
 description = "Pipeline de descarga forense de tres capas: orquestación, monitoreo y auditoría"
 requires-python = ">=3.10"
 license = { text = "MIT" }
