@@ -318,8 +318,13 @@ class TestModoWatchdog:
             # Recién registrado: sigue activo.
             assert len(monitor.tick()) == 1
 
-            # Simulamos que pasaron 10s sin que llegara ningún evento nuevo,
-            # envejeciendo la marca del registro (no el mtime del archivo).
+            # Un .part realmente abandonado envejece por los dos lados: dejan
+            # de llegar eventos Y el archivo deja de escribirse. Envejecer solo
+            # la marca describía un estado imposible —sin eventos pero escrito
+            # hace 0s—, que es justo el de una descarga VIVA de un archivo
+            # grande: Windows casi no emite `modified` mientras se escribe.
+            viejo = time.time() - 10
+            os.utime(path, (viejo, viejo))
             with monitor._lock:
                 marca, tam = monitor._activos[path]
                 monitor._activos[path] = (marca - 10, tam)
@@ -684,3 +689,191 @@ class TestCabeceraRespetaElAncho:
     def test_con_una_ruta_larga_no_desborda(self):
         largo = "G:/Rips/" + "carpeta_muy_larga/" * 8
         assert len(self._cab(62, largo)) <= 62
+
+
+# =============================================================================
+# TESTS: el watchdog no puede depender solo de los eventos
+# =============================================================================
+
+
+class TestWatchdogNoDependeDeLosEventos:
+    """En Windows `ReadDirectoryChangesW` avisa cuando NTFS actualiza la entrada
+    de directorio, no en cada escritura. Medido: 4 MB escritos en 5s producen
+    1 `created` y **2** `modified`. Un .mp4 grande queda entonces congelado en
+    el tamaño del primer evento —normalmente 0 B, el de `on_created`— y, peor,
+    `tick()` lo purga por vencido aunque se esté descargando.
+
+    `os.stat()` sí ve el tamaño y el mtime reales en cada consulta, así que el
+    evento sirve para *descubrir* el archivo y `stat` para medirlo.
+    """
+
+    def _monitor(self, tmp, mock_watchdog_module):
+        mock_mod, _, _ = mock_watchdog_module
+        with patch.dict(
+            "sys.modules",
+            {
+                "watchdog": mock_mod,
+                "watchdog.observers": mock_mod.observers,
+                "watchdog.events": mock_mod.events,
+            },
+        ):
+            mod = __import__(MONITOR_MODULE, fromlist=["ModoWatchdog"])
+            return mod.ModoWatchdog(tmp)
+
+    def test_el_tamano_sale_del_disco_no_del_evento(
+        self, temp_rips_dir, mock_watchdog_module
+    ):
+        """El .part creció después del último evento: debe verse el tamaño real."""
+        monitor = self._monitor(temp_rips_dir, mock_watchdog_module)
+        path = os.path.join(temp_rips_dir, "video.mp4.part")
+        with open(path, "wb") as f:
+            f.write(b"")
+        monitor._registrar(path)  # on_created: 0 bytes
+
+        with open(path, "ab") as f:  # sigue bajando, sin más eventos
+            f.write(b"x" * 5_000_000)
+
+        activos = monitor.tick()
+        assert len(activos) == 1
+        assert activos[0][2] == 5_000_000, "se mostró el tamaño del evento, no el real"
+
+    def test_no_purga_un_part_que_sigue_creciendo_sin_eventos(
+        self, temp_rips_dir, mock_watchdog_module
+    ):
+        """Sin eventos nuevos durante 10s, pero el archivo se escribió recién."""
+        monitor = self._monitor(temp_rips_dir, mock_watchdog_module)
+        path = os.path.join(temp_rips_dir, "video.mp4.part")
+        with open(path, "wb") as f:
+            f.write(b"x" * 1024)
+        monitor._registrar(path)
+
+        # El último evento quedó viejo: es lo que pasa con un mp4 grande.
+        with monitor._lock:
+            visto, tam = monitor._activos[path]
+            monitor._activos[path] = (visto - 10, tam)
+
+        assert len(monitor.tick()) == 1, "purgó una descarga viva por falta de eventos"
+
+    def test_el_crecimiento_solo_ya_lo_mantiene_vivo(
+        self, temp_rips_dir, mock_watchdog_module
+    ):
+        """Tercera señal, con las otras dos apagadas: sin eventos y con mtime
+        obsoleto —metadatos cacheados—, un .part que crece sigue vivo."""
+        monitor = self._monitor(temp_rips_dir, mock_watchdog_module)
+        path = os.path.join(temp_rips_dir, "video.mp4.part")
+        with open(path, "wb") as f:
+            f.write(b"x" * 1024)
+        monitor._registrar(path)
+
+        with open(path, "ab") as f:
+            f.write(b"x" * 1024)
+        viejo = time.time() - 3600
+        os.utime(path, (viejo, viejo))
+        with monitor._lock:
+            marca, tam = monitor._activos[path]
+            monitor._activos[path] = (marca - 10, tam)
+
+        assert len(monitor.tick()) == 1
+class TestPanelDibujaElTerminado:
+    def _dibujar(self, activos, terminado=None, carpeta="~/a/"):
+        mod = __import__(MONITOR_MODULE, fromlist=["dibujar_panel"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.dibujar_panel(
+                activos, {}, 0, "G:/Rips", "WATCHDOG", carpeta, terminado,
+                alto=24, ancho=100,
+            )
+        return _sin_ansi(buf.getvalue())
+
+    def test_muestra_el_terminado_en_vez_de_esperando(self):
+        salida = self._dibujar([], terminado=("uno.mp4", 4096))
+        assert "uno.mp4" in salida and "esperando" not in salida
+
+    def test_sin_terminado_sigue_diciendo_esperando(self):
+        assert "esperando .part..." in self._dibujar([], terminado=None)
+
+    def test_el_activo_gana_sobre_el_terminado(self):
+        act = [("G:/Rips/a/dos.mp4.part", "dos.mp4.part", 900)]
+        salida = self._dibujar(act, terminado=("uno.mp4", 4096))
+        assert "dos.mp4.part" in salida and "uno.mp4" not in salida
+
+
+class TestUltimoArchivoTerminado:
+    """Medido en producción: un `.mp4` de 0.97 MB estuvo presente en 1 de 59
+    muestras de 0.25s. Por eso "terminó" NO puede deducirse de `tick()` —el
+    archivo puede no aparecer nunca en la lista de activos— sino del renombrado
+    del `.part`, que en watchdog es un evento puntual y en polling es la
+    desaparición entre dos ciclos.
+    """
+
+    def _watchdog(self, tmp, mock_watchdog_module):
+        mock_mod, _, _ = mock_watchdog_module
+        with patch.dict(
+            "sys.modules",
+            {
+                "watchdog": mock_mod,
+                "watchdog.observers": mock_mod.observers,
+                "watchdog.events": mock_mod.events,
+            },
+        ):
+            mod = __import__(MONITOR_MODULE, fromlist=["ModoWatchdog"])
+            return mod.ModoWatchdog(tmp)
+
+    def test_watchdog_guarda_nombre_y_tamano_del_archivo_final(
+        self, temp_rips_dir, mock_watchdog_module
+    ):
+        monitor = self._watchdog(temp_rips_dir, mock_watchdog_module)
+        final = os.path.join(temp_rips_dir, "uno.mp4")
+        with open(final, "wb") as f:
+            f.write(b"x" * 4096)
+        monitor._completar(final)
+        assert monitor.terminado() == ("uno.mp4", 4096)
+
+    def test_watchdog_vence_pasada_la_retencion(
+        self, temp_rips_dir, mock_watchdog_module
+    ):
+        monitor = self._watchdog(temp_rips_dir, mock_watchdog_module)
+        final = os.path.join(temp_rips_dir, "uno.mp4")
+        with open(final, "wb") as f:
+            f.write(b"x")
+        monitor._completar(final)
+        assert monitor.terminado(time.time() + 5) is None
+
+    def test_sin_nada_completado_no_hay_terminado(
+        self, temp_rips_dir, mock_watchdog_module
+    ):
+        assert self._watchdog(temp_rips_dir, mock_watchdog_module).terminado() is None
+
+    def test_watchdog_ignora_un_final_inexistente(
+        self, temp_rips_dir, mock_watchdog_module
+    ):
+        """Si el archivo ya no está, no hay tamaño que informar."""
+        monitor = self._watchdog(temp_rips_dir, mock_watchdog_module)
+        monitor._completar(os.path.join(temp_rips_dir, "fantasma.mp4"))
+        assert monitor.terminado() is None
+
+    def test_polling_detecta_el_renombrado_entre_ciclos(self, temp_rips_dir):
+        mod = __import__(MONITOR_MODULE, fromlist=["ModoPolling"])
+        monitor = mod.ModoPolling(temp_rips_dir)
+        parte = os.path.join(temp_rips_dir, "uno.mp4.part")
+        with open(parte, "wb") as f:
+            f.write(b"x" * 2048)
+
+        assert len(monitor.tick()) == 1
+        os.replace(parte, parte[: -len(".part")])  # gallery-dl lo renombra
+        assert monitor.tick() == []
+        assert monitor.terminado() == ("uno.mp4", 2048)
+
+    def test_polling_no_cuenta_un_part_borrado_sin_renombrar(self, temp_rips_dir):
+        """Un `.part` que desaparece sin dejar archivo final es una descarga
+        abortada, no una terminada."""
+        mod = __import__(MONITOR_MODULE, fromlist=["ModoPolling"])
+        monitor = mod.ModoPolling(temp_rips_dir)
+        parte = os.path.join(temp_rips_dir, "uno.mp4.part")
+        with open(parte, "wb") as f:
+            f.write(b"x")
+
+        monitor.tick()
+        os.remove(parte)
+        monitor.tick()
+        assert monitor.terminado() is None

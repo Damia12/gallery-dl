@@ -47,6 +47,23 @@ RIPS_DIR = cargar_rips_dir()
 VENTANA_ACTIVO = 5  # solo archivos .part que crecieron en los últimos 5s
 VENTANA_VEL = 3
 
+RETENCION_TERMINADO = 1.0  # segundos que un archivo recién completado sigue en pantalla
+
+
+def _terminado_vigente(terminado, ahora=None, retencion=RETENCION_TERMINADO):
+    """Filtra por antigüedad el `(nombre, tamaño, momento)` de lo último bajado.
+
+    Sin esto el panel decía "esperando .part..." casi todo el tiempo: es cierto
+    —entre archivo y archivo gallery-dl está pidiendo la siguiente URL y
+    durmiendo el `sleep-request`— pero no informa de nada. Retenerlo un segundo
+    convierte ese hueco en el dato que el panel de `descarga.py` no da: cuánto
+    pesó lo que acaba de bajar.
+    """
+    ahora = time.time() if ahora is None else ahora
+    if not terminado or (ahora - terminado[2]) > retencion:
+        return None
+    return (terminado[0], terminado[1])
+
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -173,6 +190,8 @@ class ModoPolling:
         self.rips_dir = rips_dir
         self.historiales = {}
         self.modo_str = "POLLING"
+        self._previos = set()      # rutas .part del ciclo anterior
+        self._terminado = None     # (nombre, tam, momento)
 
     def get_active_parts(self):
         """Devuelve lista de archivos .part que crecieron en los últimos 5s."""
@@ -192,8 +211,31 @@ class ModoPolling:
         return [(r, n, t) for _, r, n, t in candidatos]
 
     def tick(self):
-        """Un ciclo de actualización. Devuelve la lista de activos."""
-        return self.get_active_parts()
+        """Un ciclo de actualización. Devuelve la lista de activos.
+
+        Sin eventos del SO, "este archivo terminó" se deduce comparando con el
+        ciclo anterior: un `.part` que desapareció y existe ya sin sufijo se
+        completó. Cuesta un `os.stat` por desaparición, sobre un `os.walk` que
+        de todos modos se hizo.
+        """
+        activos = self.get_active_parts()
+        actuales = {r for r, _, _ in activos}
+        for ruta in self._previos - actuales:
+            final = ruta[: -len(".part")]
+            try:
+                self._terminado = (
+                    os.path.basename(final),
+                    os.stat(final).st_size,
+                    time.time(),
+                )
+            except OSError:
+                pass  # se borró en vez de renombrarse: descarga abortada
+        self._previos = actuales
+        return activos
+
+    def terminado(self, ahora=None):
+        """`(nombre, tamaño)` del último archivo completado, si sigue vigente."""
+        return _terminado_vigente(self._terminado, ahora)
 
     def shutdown(self):
         """Limpieza al cerrar. En polling no hay nada que limpiar."""
@@ -219,6 +261,7 @@ class ModoWatchdog:
         self._lock = threading.Lock()
         # ruta -> (mtime, size)
         self._activos = {}
+        self._terminado = None  # (nombre, tam, momento) del ultimo completado
         self.historiales = {}
         self.modo_str = "WATCHDOG"
         self._observer = None
@@ -245,12 +288,15 @@ class ModoWatchdog:
                     self.parent._eliminar(event.src_path)
 
             def on_moved(self, event):
-                # Si un .part se renombra (termina descarga), eliminar el viejo
+                destino = getattr(event, "dest_path", "") or ""
                 if event.src_path.endswith(".part"):
                     self.parent._eliminar(event.src_path)
+                    # .part -> nombre final: esa descarga terminó
+                    if destino and not destino.endswith(".part"):
+                        self.parent._completar(destino)
                 # Si el destino es .part (raro, pero posible), registrar
-                if hasattr(event, "dest_path") and event.dest_path.endswith(".part"):
-                    self.parent._registrar(event.dest_path)
+                if destino.endswith(".part"):
+                    self.parent._registrar(destino)
 
         self._observer = Observer()
         self._observer.schedule(PartHandler(self), self.rips_dir, recursive=True)
@@ -270,28 +316,73 @@ class ModoWatchdog:
         with self._lock:
             self._activos.pop(ruta, None)
 
-    def tick(self):
+    def _completar(self, ruta_final):
+        """Un `.part` se renombró: ese archivo terminó de bajar.
+
+        Es la **única** señal fiable de "terminó". `tick()` no sirve para esto:
+        un archivo chico puede vivir menos que un ciclo de refresco —medido en
+        producción, un `.mp4` de 0.97 MB estuvo presente en 1 de 59 muestras de
+        0.25s— y entonces jamás llega a aparecer en la lista de activos. Los
+        eventos de creación y de renombrado sí son puntuales; los que Windows
+        escatima son los de modificación (ver `tick`).
         """
-        Devuelve la lista de archivos .part activos (<=5s sin crecer).
-        Limpia entradas vencidas para no mostrar archivos que dejaron de crecer.
+        try:
+            tam = os.stat(ruta_final).st_size
+        except OSError:
+            return
+        with self._lock:
+            self._terminado = (os.path.basename(ruta_final), tam, time.time())
+
+    def terminado(self, ahora=None):
+        """`(nombre, tamaño)` del último archivo completado, si sigue vigente."""
+        with self._lock:
+            t = self._terminado
+        return _terminado_vigente(t, ahora)
+
+    def tick(self):
+        """Devuelve los .part activos, midiendo cada uno con `os.stat()`.
+
+        El evento del watchdog sirve para **descubrir** el archivo; el tamaño y
+        la vigencia salen de `os.stat()`. En Windows `ReadDirectoryChangesW`
+        avisa cuando NTFS actualiza la entrada de directorio, no en cada
+        escritura: medido, 4 MB escritos en 5s dan 1 `created` y **2**
+        `modified`. Confiar en el evento dejaba un `.mp4` grande congelado en el
+        tamaño de su `on_created` —0 B, y en pausa, porque sin cambio de tamaño
+        nunca hay velocidad— y encima lo purgaba por vencido en plena descarga.
+
+        Un `.part` sigue activo si **cualquiera** de tres señales es reciente:
+        el último evento, el `mtime` del archivo, o que su tamaño haya crecido
+        desde el tick anterior. Se suman en vez de sustituirse porque cada una
+        falla en un escenario distinto: el `mtime` en rutas de red con
+        metadatos cacheados (ver `test_watchdog_no_purga_por_mtime_obsoleto`),
+        y el evento acá. El coste es un `os.stat()` por `.part` registrado, y
+        con `"concurrent": 1` en el conf eso es uno solo por ciclo.
         """
         ahora = time.time()
+        resultado = []
         with self._lock:
-            # Limpiar archivos que no crecieron en los últimos 5s
-            vencidos = [
-                r for r, (m, _) in self._activos.items() if (ahora - m) > VENTANA_ACTIVO
-            ]
-            for r in vencidos:
-                del self._activos[r]
+            for ruta in list(self._activos):
+                visto, tam_previo = self._activos[ruta]
+                try:
+                    st = os.stat(ruta)
+                except OSError:
+                    del self._activos[ruta]  # desapareció entre eventos
+                    continue
 
-            # Devolver como lista de tuplas (ruta, nombre, tamanio)
-            resultado = []
-            for ruta, (mtime, size) in self._activos.items():
-                resultado.append((ruta, os.path.basename(ruta), size))
+                creciendo = st.st_size != tam_previo
+                escrito_recien = (ahora - st.st_mtime) <= VENTANA_ACTIVO
+                if creciendo or escrito_recien:
+                    visto = ahora
 
-            # Ordenar por mtime descendente (más reciente primero)
+                if (ahora - visto) > VENTANA_ACTIVO:
+                    del self._activos[ruta]
+                    continue
+
+                self._activos[ruta] = (visto, st.st_size)
+                resultado.append((ruta, os.path.basename(ruta), st.st_size))
+
             resultado.sort(key=lambda x: self._activos[x[0]][0], reverse=True)
-            return resultado
+        return resultado
 
     def shutdown(self):
         """Detiene el observer de watchdog de forma segura."""
@@ -402,7 +493,8 @@ def carpeta_de(activos, rips_dir, previa=None):
 
 
 def dibujar_panel(
-    activos, historiales, spin_idx, rips_dir, modo_str, carpeta=None, alto=None, ancho=None
+    activos, historiales, spin_idx, rips_dir, modo_str, carpeta=None,
+    terminado=None, alto=None, ancho=None,
 ):
     r"""Repinta el panel entero desde la fila 1, sin pasarse de su alto.
 
@@ -433,7 +525,7 @@ def dibujar_panel(
         ancho = shutil.get_terminal_size(fallback=(80, 24)).columns
 
     ahora = time.monotonic()
-    libre = max(20, ancho - 29)  # lo que queda para el nombre tras las columnas
+    libre = max(20, ancho - 30)  # lo que queda para el nombre tras las columnas
     filas = []
 
     for ruta, nombre, tamanio in activos:
@@ -445,7 +537,7 @@ def dibujar_panel(
 
         vel_str = "—"
         color = YELLOW
-        spin = "⏸"
+        spin = "-"  # no crece: ni girando ni terminado
         if len(hist) >= 2:
             t0, s0 = hist[0]
             delta_t = ahora - t0
@@ -456,10 +548,16 @@ def dibujar_panel(
                 spin = SPINNERS[spin_idx % len(SPINNERS)]
 
         filas.append(
-            f"  {color}{spin}{RESET} {BOLD}{fmt_bytes(tamanio):>9}{RESET}  "
+            f"  {color}{spin}{RESET}  {BOLD}{fmt_bytes(tamanio):>9}{RESET}  "
             f"{color}{vel_str:>9}{RESET}   {YELLOW}{acortar_nombre(nombre, libre)}{RESET}"
         )
 
+    if not filas and terminado:
+        nom, tam = terminado
+        filas.append(
+            f"  {GREEN}+{RESET}  {BOLD}{fmt_bytes(tam):>9}{RESET}  {'':>9}   "
+            f"{GRAY}{acortar_nombre(nom, libre)}{RESET}"
+        )
     if not filas:
         filas.append(f"  {GRAY}esperando .part...{RESET}")
 
@@ -500,19 +598,23 @@ def main():
 
     if IS_WINDOWS:
         os.system("")  # activar ANSI
-        time.sleep(1)  # esperar que el panel de WT termine de abrirse
-        os.system("cls")  # limpiar residuo visual
-
-    hide_cursor()
 
     # Crear monitor (auto-detecta watchdog vs polling)
     monitor = crear_monitor(rips_dir)
     intervalo = intervalo_por_modo(monitor.modo_str, args.intervalo)
 
-    # La cabecera ya no se imprime acá: la dibuja cada frame junto al panel,
-    # así el banner de crear_monitor() —que en Windows Terminal sobrevive al
-    # borrado de pantalla— no puede correr las filas del panel hacia abajo.
-    sys.stdout.write("\033[2J\033[H")
+    # El banner de crear_monitor() se lee durante este segundo —que igual hay
+    # que esperar a que Windows Terminal termine de abrir el panel— y después
+    # desaparece. `cls` borra el buffer entero, scrollback incluido: el
+    # `\033[2J` que había antes no alcanzaba, porque WT sube el contenido al
+    # scrollback en vez de borrarlo y el banner quedaba sobre la cabecera.
+    if IS_WINDOWS:
+        time.sleep(1)
+        os.system("cls")
+    else:
+        time.sleep(0.6)
+        sys.stdout.write("\033[3J\033[2J\033[H")
+    hide_cursor()
     sys.stdout.flush()
 
     spin_idx = 0
@@ -553,6 +655,7 @@ def main():
                     del monitor.historiales[r]
 
             carpeta = carpeta_de(activos, rips_dir, carpeta)
+            terminado = monitor.terminado()
             ultimas_filas = dibujar_panel(
                 activos,
                 monitor.historiales,
@@ -560,6 +663,7 @@ def main():
                 rips_dir,
                 monitor.modo_str,
                 carpeta,
+                terminado,
             )
             spin_idx += 1
             time.sleep(intervalo)

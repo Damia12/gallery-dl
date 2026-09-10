@@ -1933,7 +1933,7 @@ def main():
                     "split-pane",
                     "--horizontal",
                     "--size",
-                    "0.35",
+                    "0.20",
                     "--title",
                     "Monitor",
                     "python",
@@ -1984,6 +1984,15 @@ def main():
 
         state["batch_index"] += len(lote)
         guardar_estado(state)
+
+        # El centinela se cierra ACÁ, no en el `finally`: `auditar.py` se niega
+        # a archivar si hay una descarga viva, y hasta ahora la auditoría del
+        # flujo normal corría con el centinela todavía refrescándose, así que
+        # ese chequeo la habría bloqueado siempre. De paso el monitor se cierra
+        # justo cuando deja de tener sentido: ya no hay .part que mirar.
+        heartbeat_stop.set()
+        if os.path.exists(CENTINELA):
+            os.remove(CENTINELA)
 
         auditar_py = Path(__file__).parent / "auditar.py"
         if auditar_py.exists():

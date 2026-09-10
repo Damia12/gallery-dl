@@ -11,7 +11,10 @@ etiqueta equivocada en un CSV que nadie mira hasta que importa.
 
 import csv
 import json
+import os
 import re
+import time
+from pathlib import Path
 import zipfile
 from datetime import datetime
 
@@ -604,6 +607,9 @@ def entorno(tmp_path):
         "rips_dir": rips_dir,
         "audit_csv": log_dir / "auditoria.csv",
         "posts_fallidos_file": tmp_path / "posts_fallidos.json",
+        # Apunta a tmp_path a propósito: si no, los tests leerían el
+        # descarga.running real y fallarían al correrlos durante una descarga.
+        "centinela": tmp_path / "descarga.running",
     }
 
 
@@ -838,3 +844,73 @@ class TestAvisoPostsFallidos:
         salida = capsys.readouterr().out
         assert "Sin logs nuevos" in salida
         assert "3 post(s)" in salida, "el aviso quedó del otro lado del return"
+
+
+class TestNoAuditarConDescargaViva:
+    """`auditar.py` comprime y **borra** los .jsonl del lote, así que correrlo
+    en medio de una corrida se lleva su log a medias. Pasó el 2026-09-04: dejó
+    en el CSV una fila con `returncode -1` y duración 0 —una corrida "FATAL"
+    que no había terminado— y en el ZIP una copia parcial que se duplicó cuando
+    descarga.py archivó la buena al cerrar.
+
+    El flujo normal **no** se ve afectado porque `descarga.py` borra el
+    centinela justo antes de lanzar la auditoría. Ese orden es parte del
+    arreglo: comprobarlo sin moverlo dejaría la auditoría sin correr nunca.
+    """
+
+    def test_centinela_fresco_es_descarga_viva(self, tmp_path):
+        c = tmp_path / "descarga.running"
+        c.write_text("1234")
+        assert auditar.hay_descarga_viva(c) is True
+
+    def test_sin_centinela_no_hay_descarga(self, tmp_path):
+        assert auditar.hay_descarga_viva(tmp_path / "descarga.running") is False
+
+    def test_un_centinela_huerfano_no_bloquea_para_siempre(self, tmp_path):
+        """Si el proceso murió sin limpiar, el archivo queda ahí: no puede
+        dejar la auditoría inutilizable. Mismo criterio que usa monitor.py."""
+        c = tmp_path / "descarga.running"
+        c.write_text("1234")
+        viejo = time.time() - 3 * 3600
+        os.utime(c, (viejo, viejo))
+        assert auditar.hay_descarga_viva(c) is False
+
+    def test_no_toca_nada_con_una_descarga_viva(self, entorno):
+        poner_log(entorno, "a", [ev_inicio(nombre="a"), ev_fin()])
+        entorno["centinela"].write_text("1234")
+
+        assert auditar.analizar_logs(entorno) is None
+        assert (entorno["log_dir"] / "a.jsonl").exists(), "borró un log en curso"
+        assert not entorno["audit_csv"].exists(), "escribió una fila a medias"
+        assert not list(entorno["log_dir"].glob("*.zip")), "archivó un log en curso"
+
+    def test_sin_centinela_audita_como_siempre(self, entorno):
+        """El flujo normal tras el cambio: descarga.py ya lo borró."""
+        poner_log(entorno, "a", [ev_inicio(nombre="a"), ev_fin()])
+
+        auditar.analizar_logs(entorno)
+        assert entorno["audit_csv"].exists()
+
+    def test_descarga_cierra_el_centinela_antes_de_auditar(self):
+        """La otra mitad del arreglo, y la que falla en silencio.
+
+        `descarga.py` borra el centinela entre el fin del lote y la llamada a
+        `auditar.py`. Si ese borrado vuelve al bloque `finally` —que es donde
+        estaba—, la auditoría del flujo normal se encuentra el centinela vivo,
+        se niega a archivar y **deja de ejecutarse para siempre** sin que nada
+        falle: los .jsonl se acumulan y el CSV no crece. Se comprueba sobre el
+        fuente porque ejecutar `main()` exigiría descargas reales.
+
+        Se mira el tramo, no la primera aparición: hay otro `os.remove` mucho
+        antes —el que limpia un centinela huérfano al arrancar— y buscarlo con
+        `index()` daba siempre ese, así que el test pasaba con el arreglo
+        deshecho.
+        """
+        src = (Path(__file__).parent.parent / "descarga.py").read_text(
+            encoding="utf-8"
+        )
+        ini = src.index('state["batch_index"] += len(lote)')
+        fin = src.index("subprocess.run([sys.executable, str(auditar_py)])")
+        assert "os.remove(CENTINELA)" in src[ini:fin], (
+            "el centinela no se cierra antes de auditar: la auditoría nunca correrá"
+        )

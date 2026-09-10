@@ -396,6 +396,33 @@ def buscar_part_huerfanos(rips_dir) -> list:
 # =============================================================================
 
 
+CENTINELA_STALE = 7200  # 2h; el mismo umbral con el que monitor.py se da por huérfano
+
+
+def hay_descarga_viva(centinela) -> bool:
+    """True si `descarga.py` está corriendo ahora mismo.
+
+    Esta función existe por un incidente real (2026-09-04): `auditar.py` corrió
+    a mano en medio de una corrida, comprimió y borró su `.jsonl` a medias, y
+    dejó en el CSV una fila con `returncode -1` y duración 0 —una corrida
+    "FATAL" que no había terminado— más una copia parcial en el ZIP que se
+    duplicó cuando `descarga.py` archivó la buena al cerrar.
+
+    En el flujo normal esto devuelve False: `descarga.py` borra el centinela
+    **antes** de lanzar la auditoría, precisamente para no bloquearse a sí
+    mismo. Ese orden es la mitad del arreglo; comprobar el centinela sin
+    moverlo dejaría la auditoría sin ejecutarse nunca.
+
+    Un centinela sin refrescar en más de `CENTINELA_STALE` segundos se da por
+    huérfano —el proceso murió sin limpiar— y no bloquea nada: si no, un cierre
+    a la fuerza inutilizaría la auditoría para siempre.
+    """
+    try:
+        return (time.time() - Path(centinela).stat().st_mtime) <= CENTINELA_STALE
+    except OSError:
+        return False
+
+
 def analizar_logs(cfg: dict | None = None) -> dict | None:
     """Audita los .jsonl pendientes en log_dir: CSV, ZIP y .part huérfanos."""
     cfg = cfg or cargar_config()
@@ -403,6 +430,13 @@ def analizar_logs(cfg: dict | None = None) -> dict | None:
 
     if not log_dir.exists():
         print(f"\n  {RED}[X] Directorio de logs no existe: {log_dir}{RESET}\n")
+        return None
+
+    centinela = cfg.get("centinela") or Path(__file__).parent / "descarga.running"
+    if hay_descarga_viva(centinela):
+        print(f"\n  {YELLOW}[!] Hay una descarga en curso: no se auditó nada.{RESET}")
+        print(f"  {GRAY}    auditar.py comprime y borra los .jsonl del lote, así que")
+        print(f"  {GRAY}    correrlo ahora se llevaría el log de la corrida viva.{RESET}\n")
         return None
 
     jsonls = sorted(log_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
